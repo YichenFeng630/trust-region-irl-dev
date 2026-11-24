@@ -22,11 +22,15 @@ transferred. The paper's own setup is kept at the `icml26` tag.
 - PPO on a frozen learned reward (`--algorithm.retraining=True`) and a PPO baseline on the true reward (`ppo_best`),
   both keeping the best and the latest model.
 - The expert batch is sampled with replacement in every IRL algorithm.
+- Baselines for the FR3 tasks: AIRL synced from RL-X (it replaces the earlier copy, which trained the policy on the
+  initial discriminator), with the same reward input as TRIRL-SPR; Diffusion Policy ported from the official code and
+  checked against it numerically. Both run through `experiment.py`.
 
 **Infrastructure**
 - MuJoCo Warp backend (`--environment.impl=warp`, MuJoCo 3.6), several times faster than MJX's JAX backend.
 - Scripts for expert data (synthetic pizza spirals, BaMPC planner demos), evaluation, path plots and videos, and
   Slurm jobs for training and retraining.
+- The evaluation scripts take every method's checkpoints and record GPU use; tests in `tests/`.
 
 ## Install
 

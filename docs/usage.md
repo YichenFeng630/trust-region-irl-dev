@@ -229,6 +229,76 @@ RL-X's PPO, unchanged except that it also keeps `best.model`. It trains on the e
 balancing: minus the ball-goal distance) and is the reference for what PPO can reach with the true reward. Its options
 are the PPO options above.
 
+### AIRL (`airl_ppo.flax_full_jit`)
+
+RL-X's AIRL with a PPO learner, synced from RL-X `0ff04fe`; its policy and critic are the same as TRIRL-SPR's. It
+replaces the earlier copy in this repository, which computed the PPO reward with the initial discriminator (the state
+from before the jitted training loop) and could not be built for action spaces with more than one dimension.
+`experiments/experiment.py` looks algorithms up in `trust_region_irl` only, so this is the version it runs. The options
+added on top of RL-X are off by default, so the defaults behave as RL-X
+([README](../trust_region_irl/algorithms/airl_ppo/README.md)):
+
+| Option | Default | Meaning |
+|---|---|---|
+| `reward_input` | observation | `embodiment-free`: g and h read only the environment's `encoder_input_indices`, the same input as TRIRL-SPR's `byol-embodiment-free` reward |
+| `nr_disc_steps` | -1 | > 0: this many discriminator gradient steps per iteration, each on `minibatch_size` agent and expert samples, as `n_disc_epochs` in the TRIRL paper's robot-task code; otherwise `nr_epochs_disc` passes over the whole batch (RL-X) |
+| `discriminator_uses_action` | False | g(s, a) instead of g(s), as `shaped-sa` in the TRIRL paper's code |
+| `max_std_dev` | -1 | > 0: the learnable policy std is projected back to at most this value after every update |
+| `log_pi_weight` | 1.0 | w in the PPO reward f - w log pi; the discriminator still uses f - log pi. The original AIRL code uses an entropy weight of 0.1 on Ant |
+| `handle_absorbing_states` | True | set False for pizza and ball balancing: they run a fixed horizon, and the demos mark their last step as absorbing only as an episode boundary |
+
+The PPO reward is logged in its two parts, `reward/f` (discriminator) and `reward/minus_log_pi` (entropy term).
+Evaluation logs the environment's task metrics (`eval/coverage`, `eval/is_success`, ... for pizza; `eval/goal_dist`,
+`eval/ball_lost` for ball balancing) and saves `best.model` next to `latest.model`.
+
+```bash
+cd experiments
+python experiment.py --algorithm.name=airl_ppo.flax_full_jit \
+  --algorithm.data_path=../trirl_dataset/rl_expert/pizza_dr_demos_100.npz \
+  --algorithm.reward_input=embodiment-free --algorithm.handle_absorbing_states=False --algorithm.std_dev=0.4 \
+  --algorithm.nr_disc_steps=3 --algorithm.learning_rate_disc=1.7e-4 --algorithm.max_grad_norm=1.0 --algorithm.log_pi_weight=0.01 \
+  --algorithm.total_timesteps=500e6 --algorithm.evaluation_and_save_frequency=2048000 \
+  --environment.name=pizza_dr_mjx --environment.impl=warp --environment.nr_envs=4096 \
+  --runner.mode=train --runner.save_model=True --runner.track_console=True
+```
+
+With the RL-X default (10 passes over the batch: 800 discriminator steps per iteration with 4096 environments and 10
+steps per rollout) the discriminator separates agent and expert samples almost perfectly on pizza within about 2M
+steps, so the command uses 3 steps per iteration. With the default `log_pi_weight=1` the policy std then still grows
+without bound: actions are clipped to [-1, 1], so a larger std raises -log pi at no cost. `log_pi_weight=0.01` keeps it
+stable. These are the settings of the pizza comparison runs.
+
+### Diffusion Policy (`diffusion_policy.flax_full_jit`)
+
+A Flax port of the state-based Diffusion Policy with the CNN U-Net (Chi et al. 2023), from the official code
+(real-stanford/diffusion_policy `5ba07ac`, `train_diffusion_unet_lowdim_workspace.yaml`). It is registered as an RL-X
+algorithm, so it runs through `experiment.py` and the Slurm jobs like the IRL methods. It trains offline on the same
+expert `.npz` and evaluates closed-loop in the environment every `evaluation_frequency` gradient steps;
+`environment.nr_envs` is the number of evaluation episodes. How the port is checked against the official code, and
+where it differs: [README](../trust_region_irl/algorithms/diffusion_policy/README.md).
+
+```bash
+cd experiments
+python experiment.py --algorithm.name=diffusion_policy.flax_full_jit \
+  --algorithm.data_path=../trirl_dataset/rl_expert/pizza_dr_demos_100.npz \
+  --algorithm.n_action_steps=8 --algorithm.total_gradient_steps=200000 --algorithm.evaluation_frequency=50000 \
+  --environment.name=pizza_dr_mjx --environment.impl=jax --environment.nr_envs=512 \
+  --runner.mode=train --runner.save_model=True --runner.track_console=True
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `n_obs_steps`, `horizon`, `n_action_steps` | 2, 16, 8 | observation history, predicted action sequence, actions executed per prediction |
+| `total_gradient_steps` | 200000 | length of training; the cosine learning-rate schedule ends here |
+| `evaluation_frequency` | 20000 | gradient steps between closed-loop evaluations (also at the last step) |
+| `num_inference_steps` | 100 | DDPM denoising steps per prediction |
+| `batch_size`, `learning_rate` | 256, 1e-4 | as the official config; the network and optimiser settings are its defaults too |
+
+`latest.model` is written at every evaluation and `best.model` when the evaluation return reaches a new high. A
+checkpoint is about 525 MB (model and EMA copy, float32). Training runs at about 35 gradient steps per second on an
+RTX A5000 (JAX memory pool about 7.8 GB). Evaluating 512 pizza episodes takes about 2.5 min with `n_action_steps=8`
+and 11-20 min with `n_action_steps=1`, since every prediction runs the full denoising chain.
+
 ## Runner options
 
 | Option | Meaning |
@@ -304,7 +374,13 @@ Training on 30 s demos needs `--environment.horizon=600`.
 ## Evaluation and videos
 
 All evaluation scripts run the deterministic policy (the mean action) on seeded random episodes, so different
-checkpoints see the same episodes. They take any saved model: TRIRL `*.model.zip`, retraining and PPO `*.model`.
+checkpoints see the same episodes. They take any saved model: TRIRL `*.model.zip`, retraining, PPO and AIRL `*.model`,
+and Diffusion Policy `*.model`, which runs closed-loop action chunks with its sampling noise drawn from `--seed`.
+`plot_policy_paths.py` and `eval_policies.py` roll every checkpoint out twice on the same episodes: the first run
+includes the JIT compilation, the second is timed while nvidia-smi records GPU use (`gpu_<label>.csv`, summary under
+`compute` in `metrics.json`; set `XLA_PYTHON_CLIENT_PREALLOCATE=false`). GPU evaluation is not bit-for-bit
+reproducible; do not set `XLA_FLAGS=--xla_gpu_deterministic_ops=true`, which breaks MJX's JAX backend in this setup
+(the end effector stays at zero).
 
 | Script | Output |
 |---|---|
@@ -313,6 +389,9 @@ checkpoints see the same episodes. They take any saved model: TRIRL `*.model.zip
 | `scripts/balance/render_policy.py CKPT OUT [--seconds 50] [--expert-raw RAW]` | one video per goal family plus all joined, with the goal path and the ball trail drawn on the plate |
 | `scripts/balance/render_expert.py RAW OUT` | the same videos for BaMPC demos |
 | `scripts/balance/dynamics_sweep.py OUT.json CKPT... [--variants JSON]` | how much each dynamics variant hurts a trained policy, without retraining |
+| `scripts/gpu_cost/bench_policy.py OUT {pizza\|balance} CKPT...` | inference cost of the policy alone (no simulator), per control step, with GPU use |
+| `scripts/evaluation/summarize.py OUT metrics.json...` | one row per method over seeds (mean, std); run names `<method>_seeds<N>` |
+| `scripts/gpu_cost/gpu_monitor.sh OUT_PREFIX CMD...` | runs a command (e.g. a training run) while sampling nvidia-smi, then summarises GPU time, memory and power |
 
 Rendering needs `MUJOCO_GL=egl` on a headless GPU node (`run_job.sh` sets it).
 
@@ -330,6 +409,22 @@ The question: does a reward learned with TRIRL on one robot setup still produce 
 5. Compare with `eval_policies.py --dynamics ...`: the reward transfers if PPO on it gets about as close to the
    true-reward reference under the variant as on the nominal task.
 
+## Tests
+
+```bash
+python -m pytest tests -m "not slow"    # quick checks
+python -m pytest tests                  # also short training runs, a few minutes each (a GPU is recommended)
+```
+
+`tests/test_airl.py` checks that discriminator updates reach the policy, the reward input and the added AIRL options;
+`tests/test_dp.py` overfits a small Diffusion Policy and reloads it; `tests/test_policy_checkpoint.py` checks the actors
+the evaluation scripts get from `load_actor` (Diffusion Policy action chunks and history, the Gaussian mean action, and
+that the scripts' rollout matches the evaluation inside Diffusion Policy training); `tests/test_gpu_usage.py` checks the
+GPU recording (skipped without nvidia-smi). `tests/test_dp_parity.py` compares every module of the Diffusion Policy port with the official
+PyTorch code on CPU, with the same weights and random draws. It needs torch, diffusers 0.43, einops, numba, zarr and a
+checkout of real-stanford/diffusion_policy at `5ba07ac` (`DIFFUSION_POLICY_REF`, default `../refs/diffusion_policy`),
+and is skipped otherwise.
+
 ## Repository layout
 
 ```
@@ -338,17 +433,23 @@ trust_region_irl/
     trirl_ppo_spr/        TRIRL with SPR (BYOL multi-step) reward features
     ppo_retraining/       PPO on a frozen learned reward (used by retraining mode)
     ppo_best/             RL-X PPO that keeps best.model (true-reward baseline)
+    airl_ppo/flax_full_jit/   AIRL synced from RL-X, with the reward input and discriminator options above
+    diffusion_policy/     Diffusion Policy, a port of the official state-based CNN U-Net
     ...                   the paper's algorithms and baselines
   environments/
     pusht_mjx/            PushT (FR3, T block); its data/assets hold the FR3 meshes the other tasks link to
     pizza_dr_mjx/         pizza spreading with domain randomisation
     balance_fr3_mjx/      BaMPC ball balancing
     ...                   the paper's environments
-  policy_checkpoint.py    load the policy of any saved model
+  policy_checkpoint.py    load the policy of any saved model (load_actor: one interface for Gaussian policies and Diffusion Policy)
+  gpu_usage.py            record GPU use with nvidia-smi around a block of code
 scripts/
   slurm/                  cluster jobs (train, retrain, PPO baseline, run any script)
   mjwarp/                 Warp vs JAX backend checks for PushT
   pizza/                  workspace sweep, start table, demos, path plots
   balance/                BaMPC tools (bampc/), dataset, checks, evaluation, videos, dynamics sweep
+  evaluation/             summary of evaluation results over seeds
+  gpu_cost/               GPU cost: policy-only inference benchmark, GPU monitor for training runs
+tests/                    pytest checks for AIRL, Diffusion Policy, the evaluation actors and GPU recording
 experiments/              experiment.py (entry point); runs/ is created here
 ```
