@@ -7,10 +7,16 @@ would have ended the episode is marked. Paths are drawn in pizza-centred cm.
 Writes to OUT_DIR: paths.png (8 pizzas per checkpoint), coverage.png (coverage over the episode), metrics.json and one
 rollout_<label>.npz per checkpoint.
 
+Any saved model works (TRIRL, AIRL, PPO: deterministic mean action; Diffusion Policy: closed-loop action chunks with
+sampling noise drawn from --seed, so the result is reproducible). Each checkpoint is rolled out twice on the same
+pizzas: the first run includes the JIT compilation, the second is timed while nvidia-smi records GPU use
+(gpu_<label>.csv; summary under "compute" in metrics.json; set XLA_PYTHON_CLIENT_PREALLOCATE=false).
+
     python scripts/pizza/plot_policy_paths.py OUT_DIR CKPT [CKPT ...] [--n-eval 64] [--impl warp]
 """
 import argparse
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -21,8 +27,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from trust_region_irl.environments.pizza_dr_mjx.environment import PizzaSpreadDR
-from trust_region_irl.algorithms.trirl_ppo_spr.flax_full_jit.policy import Policy
-from trust_region_irl.policy_checkpoint import load_policy_params
+from trust_region_irl.policy_checkpoint import load_actor
+from trust_region_irl.gpu_usage import GpuUsage
 
 parser = argparse.ArgumentParser()
 parser.add_argument("out_dir")
@@ -41,19 +47,24 @@ SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#62
 
 env = PizzaSpreadDR(render=False, nr_envs=N, impl=args.impl, wander_margin=10.0)   # no cut during the rollout
 H, HOLD = env.horizon, int(round(env.wander_hold_s * env.CONTROL_FREQ))
-policy = Policy((2,), 1.0, jnp.arange(env.single_observation_space.shape[0]))
+OBS_DIM = env.single_observation_space.shape[0]
 
 
-@jax.jit
-def rollout(params, keys):
-    s0 = env.reset(keys, True)
-    def step(s, _):
-        mean, _ = policy.apply(params, s.next_observation)
-        s2 = env.step(s, mean)
-        rec = dict(ee=s2.actual_next_observation[:, :3], landed=s2.info["env_info/touched_down"], lifted=s2.info["env_info/lifted"],
-                   cov=jnp.where(s2.terminated | s2.truncated, s2.info["rollout/coverage"], s2.info["env_info/coverage"]))
-        return s2, rec
-    return s0.next_observation, jax.lax.scan(step, s0, None, length=H)[1]
+def make_rollout(actor):
+    @jax.jit
+    def rollout(params, keys, actor_key):
+        s0 = env.reset(keys, True)
+        a0 = actor.init(s0.next_observation, actor_key)
+        def step(carry, t):
+            s, a = carry
+            action, a = actor.act(params, a, s.next_observation, t, s.terminated | s.truncated)
+            s2 = env.step(s, action)
+            rec = dict(ee=s2.actual_next_observation[:, :3], landed=s2.info["env_info/touched_down"], lifted=s2.info["env_info/lifted"],
+                       cov=jnp.where(s2.terminated | s2.truncated, s2.info["rollout/coverage"], s2.info["env_info/coverage"]),
+                       action_norm=jnp.linalg.norm(jnp.clip(action, -1.0, 1.0), axis=-1))
+            return (s2, a), rec
+        return s0.next_observation, jax.lax.scan(step, (s0, a0), jnp.arange(H))[1]
+    return rollout
 
 
 def label(ckpt):
@@ -62,9 +73,24 @@ def label(ckpt):
 
 
 keys = jax.random.split(jax.random.PRNGKey(args.seed), N)
+actor_key = jax.random.fold_in(jax.random.PRNGKey(args.seed), 1)   # Diffusion Policy's sampling noise, same for every checkpoint
 results, runs = {}, []
 for ckpt in args.ckpts:
-    obs0, rec = rollout(load_policy_params(ckpt), keys)
+    actor, params, algorithm = load_actor(ckpt, OBS_DIM, 2)
+    rollout = make_rollout(actor)
+    t0 = time.time()
+    first = jax.block_until_ready(rollout(params, keys, actor_key))                       # includes the JIT compilation
+    compile_and_run_s = time.time() - t0
+    with GpuUsage(OUT / f"gpu_{label(ckpt).replace('/', '_')}.csv") as gpu:            # timed run, same pizzas and noise
+        obs0, rec = jax.block_until_ready(rollout(params, keys, actor_key))
+    pairs = list(zip(jax.tree.leaves(first), jax.tree.leaves((obs0, rec))))
+    reproducible = all(np.array_equal(np.asarray(x), np.asarray(y)) for x, y in pairs)
+    max_diff_between_runs = max(float(np.abs(np.asarray(x, np.float64) - np.asarray(y, np.float64)).max()) for x, y in pairs)
+    compute = dict(algorithm=algorithm, n_episodes=N, steps=H, first_run_incl_compile_s=compile_and_run_s,
+                   rollout_s=gpu.summary["wall_s"], env_steps_per_s=N * H / gpu.summary["wall_s"],
+                   ms_per_control_step=1000 * gpu.summary["wall_s"] / H, reproducible=reproducible,
+                   max_abs_diff_between_runs=max_diff_between_runs,
+                   backend=jax.default_backend(), **{k: v for k, v in gpu.summary.items() if k != "wall_s"})
     pizza = np.asarray(obs0)[:, 3:6]; rec = {k: np.asarray(v) for k, v in rec.items()}   # rec[k]: (H, N)
     r = np.linalg.norm(rec["ee"][:, :, :2] - pizza[None, :, :2], axis=-1); R = pizza[None, :, 2]
     landed, lifted = rec["landed"] > 0.5, rec["lifted"] > 0.5
@@ -82,6 +108,17 @@ for ckpt in args.ckpts:
              touched_down=float((touch >= 0).mean()), lifted=float(lifted[-1].mean()), would_be_cut=float((cut_step >= 0).mean()),
              coverage_at_cut=float(np.mean(cov[cut_step[cut_step >= 0], np.where(cut_step >= 0)[0]])) if (cut_step >= 0).any() else None,
              off_pizza_frac_while_landed=float((landed & (r > R)).sum() / max(landed.sum(), 1)))
+    # with the cut (as the training env): a cut episode keeps the coverage it had when the cut fired
+    cov_cut = np.where(cut_step >= 0, cov[np.maximum(cut_step, 0), np.arange(N)], cov[-1])
+    m.update(coverage_with_cut=float(cov_cut.mean()), success_with_cut=float((cov_cut >= env.success_threshold).mean()),
+             clean_finish=float(((cov[-1] >= env.success_threshold) & lifted[-1]).mean()))
+    # stopping: the last 20 commanded actions while on the pizza before lift-off (lift-off needs 10 steps below 0.05)
+    an = rec["action_norm"]; on = landed & ~lifted
+    tails = [an[np.where(on[:, i])[0][-20:], i] for i in range(N) if on[:, i].any()]
+    if tails:
+        m.update(stop_action_norm_median=float(np.median(np.concatenate(tails))),
+                 stop_action_norm_frac_below_005=float(np.mean(np.concatenate(tails) < 0.05)))
+    m["compute"] = compute
     name = label(ckpt); runs.append(name); results[name] = m
     print(name, json.dumps(m), flush=True)
     np.savez_compressed(OUT / f"rollout_{name.replace('/', '_')}.npz", pizza=pizza, cut_step=cut_step, **rec)

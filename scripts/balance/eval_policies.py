@@ -7,9 +7,16 @@ the ball is lost. Every checkpoint sees the same episodes (same seed). Writes to
 
     python scripts/balance/eval_policies.py OUT_DIR CKPT [CKPT ...] [--expert trirl_dataset/rl_expert/balance_fr3_varied_300.npz]
         [--n-eval 100] [--impl warp] [--dynamics ball_mass_scale=4 tilt_gain_scale=0.5 ...]
+
+Any saved model works (TRIRL, AIRL, PPO: deterministic mean action; Diffusion Policy: closed-loop action chunks with
+sampling noise drawn from --seed). Each checkpoint is rolled out twice on the same episodes: the first run includes the
+JIT compilation, the second is timed while nvidia-smi records GPU use (gpu_<label>.csv; summary under "compute" in
+metrics.json; set XLA_PYTHON_CLIENT_PREALLOCATE=false). The goal distance is also reported over the episodes where
+the ball stays on the plate only ("_not_lost"), since a lost ball keeps falling and inflates the mean.
 """
 import argparse
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -20,8 +27,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from trust_region_irl.environments.balance_fr3_mjx.environment import BalanceFR3
-from trust_region_irl.algorithms.trirl_ppo_spr.flax_full_jit.policy import Policy
-from trust_region_irl.policy_checkpoint import load_policy_params
+from trust_region_irl.policy_checkpoint import load_actor
+from trust_region_irl.gpu_usage import GpuUsage
 
 parser = argparse.ArgumentParser()
 parser.add_argument("out_dir")
@@ -41,17 +48,28 @@ SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#62
 
 env = BalanceFR3(render=False, nr_envs=args.n_eval, impl=args.impl, **DYN)
 H = env.horizon
-policy = Policy((2,), 1.0, jnp.arange(env.single_observation_space.shape[0]))
+OBS_DIM = env.single_observation_space.shape[0]
 
 
-def rollout(act_fn):
+class ZeroActor:
+    def init(self, obs, key):
+        return {}
+
+    def act(self, params, state, obs, t, new_episode):
+        return jnp.zeros(obs.shape[:-1] + (2,)), state
+
+
+def rollout(actor):
     @jax.jit
-    def run(params, keys):
+    def run(params, keys, actor_key):
         s0 = env.reset(keys, True)
-        def step(s, _):
-            s2 = env.step(s, act_fn(params, s.next_observation))
-            return s2, dict(obs=s2.actual_next_observation, dist=s2.info["env_info/goal_dist"], lost=s2.info["env_info/ball_lost"])
-        return s0.info_episode_store["fam"], jax.lax.scan(step, s0, None, length=H)[1]
+        a0 = actor.init(s0.next_observation, actor_key)
+        def step(carry, t):
+            s, a = carry
+            action, a = actor.act(params, a, s.next_observation, t, s.terminated | s.truncated)
+            s2 = env.step(s, action)
+            return (s2, a), dict(obs=s2.actual_next_observation, dist=s2.info["env_info/goal_dist"], lost=s2.info["env_info/ball_lost"])
+        return s0.info_episode_store["fam"], jax.lax.scan(step, (s0, a0), jnp.arange(H))[1]
     return run
 
 
@@ -65,9 +83,13 @@ def plate_local(obs, idx):
 
 def summarise(dist, lost, fam):
     """dist, lost: (time, episodes); fam: (episodes,)."""
+    kept = lost.max(0) < 0.5                                  # the ball never left the plate
     def one(m):
+        k = m & kept
         return dict(goal_dist_cm=float(100 * dist[:, m].mean()), goal_dist_2nd_half_cm=float(100 * dist[H // 2:, m].mean()),
-                    ball_lost=float(lost[:, m].max(0).mean()), n=int(m.sum()))
+                    goal_dist_cm_not_lost=float(100 * dist[:, k].mean()) if k.any() else None,
+                    goal_dist_2nd_half_cm_not_lost=float(100 * dist[H // 2:, k].mean()) if k.any() else None,
+                    ball_lost=float(lost[:, m].max(0).mean()), n=int(m.sum()), n_not_lost=int(k.sum()))
     return {"all": one(np.ones_like(fam, bool)), **{name: one(fam == f) for f, name in enumerate(FAMS) if (fam == f).any()}}
 
 
@@ -77,15 +99,31 @@ def label(ckpt):
 
 
 keys = jax.random.split(jax.random.PRNGKey(args.seed), args.n_eval)
-results, recs = {"dynamics": DYN}, {}
-fam, rec = rollout(lambda p, o: jnp.zeros(o.shape[:-1] + (2,)))(None, keys)
+actor_key = jax.random.fold_in(jax.random.PRNGKey(args.seed), 1)   # Diffusion Policy's sampling noise, same for every checkpoint
+results, recs, computes = {"dynamics": DYN}, {}, {}
+fam, rec = rollout(ZeroActor())(None, keys, actor_key)
 fam = np.asarray(fam); recs["zero action"] = {k: np.asarray(v) for k, v in rec.items()}
-run_policy = rollout(lambda p, o: policy.apply(p, o)[0])
 for ckpt in args.ckpts:
-    _, rec = run_policy(load_policy_params(ckpt), keys)
-    recs[label(ckpt)] = {k: np.asarray(v) for k, v in rec.items()}
+    actor, params, algorithm = load_actor(ckpt, OBS_DIM, 2)
+    run_policy = rollout(actor)
+    t0 = time.time()
+    first = jax.block_until_ready(run_policy(params, keys, actor_key))                    # includes the JIT compilation
+    compile_and_run_s = time.time() - t0
+    with GpuUsage(OUT / f"gpu_{label(ckpt).replace('/', '_')}.csv") as gpu:            # timed run, same episodes and noise
+        out = jax.block_until_ready(run_policy(params, keys, actor_key))
+    pairs = list(zip(jax.tree.leaves(first), jax.tree.leaves(out)))
+    reproducible = all(np.array_equal(np.asarray(x), np.asarray(y)) for x, y in pairs)
+    max_diff_between_runs = max(float(np.abs(np.asarray(x, np.float64) - np.asarray(y, np.float64)).max()) for x, y in pairs)
+    computes[label(ckpt)] = dict(algorithm=algorithm, n_episodes=args.n_eval, steps=H, first_run_incl_compile_s=compile_and_run_s,
+                                 rollout_s=gpu.summary["wall_s"], env_steps_per_s=args.n_eval * H / gpu.summary["wall_s"],
+                                 ms_per_control_step=1000 * gpu.summary["wall_s"] / H, reproducible=reproducible,
+                                 max_abs_diff_between_runs=max_diff_between_runs,
+                                 backend=jax.default_backend(), **{k: v for k, v in gpu.summary.items() if k != "wall_s"})
+    recs[label(ckpt)] = {k: np.asarray(v) for k, v in out[1].items()}
 for name, rec in recs.items():
     results[name] = summarise(rec["dist"], rec["lost"], fam)
+    if name in computes:
+        results[name]["compute"] = computes[name]
     print(name, json.dumps(results[name]["all"]), flush=True)
 
 e_dist = e_fam = None
