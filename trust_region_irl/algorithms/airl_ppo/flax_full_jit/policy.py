@@ -42,6 +42,15 @@ class Policy(nn.Module):
         return policy_mean, policy_logstd
 
 
+def cap_std_dev(params, max_std_dev):
+    """Projects the learnable log std onto log std <= log(max_std_dev). max_std_dev <= 0 returns params unchanged."""
+    if max_std_dev <= 0:
+        return params
+    p = params["params"]
+    capped = jnp.minimum(p["policy_logstd"], jnp.log(max_std_dev))
+    return type(params)({**params, "params": type(p)({**p, "policy_logstd": capped})})
+
+
 def get_processed_action_function(action_clipping_and_rescaling, env_as_low, env_as_high):
     if action_clipping_and_rescaling:
         def get_clipped_and_scaled_action(action, env_as_low=env_as_low, env_as_high=env_as_high):

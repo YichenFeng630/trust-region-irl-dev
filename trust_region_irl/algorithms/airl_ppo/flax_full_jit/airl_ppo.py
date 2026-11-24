@@ -15,7 +15,7 @@ import optax
 import wandb
 
 from trust_region_irl.algorithms.airl_ppo.flax_full_jit.general_properties import GeneralProperties
-from trust_region_irl.algorithms.airl_ppo.flax_full_jit.policy import get_policy
+from trust_region_irl.algorithms.airl_ppo.flax_full_jit.policy import get_policy, cap_std_dev
 from trust_region_irl.algorithms.airl_ppo.flax_full_jit.critic import get_critic
 from trust_region_irl.algorithms.airl_ppo.flax_full_jit.discriminator import get_discriminator
 from trust_region_irl.algorithms.airl_ppo.flax_full_jit.data_utils import prepare_expert_data, expert_data_spec
@@ -68,15 +68,23 @@ class AIRL_PPO:
         # AIRL Attributes
         self.data_path = config.algorithm.data_path
         self.nr_epochs_disc = config.algorithm.nr_epochs_disc
+        self.nr_disc_steps = config.algorithm.nr_disc_steps
         self.learning_rate_disc = config.algorithm.learning_rate_disc
         self.env_reward_frac = config.algorithm.env_reward_frac
         self.handle_absorbing_states = config.algorithm.handle_absorbing_states
         self.gp_lambda = config.algorithm.gp_lambda
         self.gp_alpha = config.algorithm.gp_alpha
+        self.discriminator_uses_action = config.algorithm.discriminator_uses_action
+        self.max_std_dev = config.algorithm.max_std_dev
+        self.log_pi_weight = config.algorithm.log_pi_weight
         self.num_data_samples = prepare_expert_data(self.data_path)["states"].shape[0]
 
         if self.minibatch_size > self.batch_size:
             raise ValueError("Minibatch size must not be larger than batch size")
+        if self.nr_disc_steps > self.nr_epochs_disc * (self.batch_size // self.minibatch_size):
+            raise ValueError("nr_disc_steps must not exceed nr_epochs_disc * (batch size // minibatch size)")
+        # discriminator gradient steps per iteration
+        self.disc_steps_per_update = self.nr_disc_steps if self.nr_disc_steps > 0 else self.nr_epochs_disc * (self.batch_size // self.minibatch_size)
 
         if self.evaluation_and_save_frequency % self.batch_size != 0:
             raise ValueError("Evaluation and save frequency must be a multiple of batch size")
@@ -99,7 +107,7 @@ class AIRL_PPO:
             return self.learning_rate * fraction
 
         def linear_schedule_disc(count):
-            fraction = 1.0 - (count // (self.nr_minibatches * self.nr_epochs_disc)) / self.nr_updates
+            fraction = 1.0 - (count // self.disc_steps_per_update) / self.nr_updates
             return self.learning_rate_disc * fraction
 
         learning_rate = linear_schedule if self.anneal_learning_rate else self.learning_rate
@@ -113,7 +121,7 @@ class AIRL_PPO:
 
         self.policy_state = TrainState.create(
             apply_fn=self.policy.apply,
-            params=self.policy.init(policy_key, env_state.next_observation),
+            params=cap_std_dev(self.policy.init(policy_key, env_state.next_observation), self.max_std_dev),
             tx=optax.chain(
                 optax.clip_by_global_norm(self.max_grad_norm),
                 optax.inject_hyperparams(optax.adam)(learning_rate=learning_rate),
@@ -141,6 +149,8 @@ class AIRL_PPO:
         if self.save_model:
             os.makedirs(self.save_path)
             self.latest_model_file_name = "latest.model"
+            self.best_model_file_name = "best.model"
+            self.best_eval_return = -np.inf
             self.latest_model_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
 
  
@@ -231,7 +241,10 @@ class AIRL_PPO:
                         interpolated_abs = 0.0 * expert_absorbing # assume interpolated state to be non-absorbing
                         interpolated_log_prob = 0.0 * expert_log_prob # assume that the interpolated action is the expert's action 
                         grad_state, grad_action, grad_next_state = jax.grad(lambda s, a, sn, ab, log_p: jnp.sum(self.discriminator.apply(discriminator_params, s, a, sn, ab, log_p)), argnums=(0, 1, 2))(interpolated_state, interpolated_action, interpolated_next_state, interpolated_abs, interpolated_log_prob)
-                        grad_norm = jnp.sqrt(jnp.sum(jnp.square(grad_state)) + jnp.sum(jnp.square(grad_next_state)))
+                        grad_sq = jnp.sum(jnp.square(grad_state)) + jnp.sum(jnp.square(grad_next_state))
+                        if self.discriminator_uses_action:  # the action is an input too (shaped-sa in the paper code)
+                            grad_sq = grad_sq + jnp.sum(jnp.square(grad_action))
+                        grad_norm = jnp.sqrt(grad_sq)
                         gp = (grad_norm - 1.0) ** 2
 
                         bce_loss = bce_agent + bce_expert + gp_lambda * gp
@@ -272,6 +285,7 @@ class AIRL_PPO:
                     batch_indices_disc = jax.random.permutation(subkey, batch_indices_disc, axis=1, independent=True)
                     batch_indices_disc = batch_indices_disc[:, :self.nr_minibatches * self.minibatch_size]
                     batch_indices_disc = batch_indices_disc.reshape((self.nr_epochs_disc * self.nr_minibatches, self.minibatch_size))
+                    batch_indices_disc = batch_indices_disc[:self.disc_steps_per_update]   # all of them unless nr_disc_steps > 0
 
                     def airl_minibatch_update(carry, minibatch_indices_disc):
 
@@ -335,6 +349,15 @@ class AIRL_PPO:
                     else:
                         airl_reward_absorbing_state = jnp.asarray(0.0)
 
+                    # The discriminator logits are f - log pi (AIRL). The policy reward is f - w log pi with w = log_pi_weight:
+                    # w = 1 gives the logits themselves (RL-X, TRIRL paper code); w < 1 weakens the entropy term, as the
+                    # original AIRL code does (policy reward g plus an entropy bonus of 0.1 on Ant). The discriminator is unchanged.
+                    f_reward = airl_reward + log_probs
+                    airl_reward = f_reward - self.log_pi_weight * log_probs
+                    if self.handle_absorbing_states:
+                        airl_reward_absorbing_state = airl_reward_absorbing_state + (1.0 - self.log_pi_weight) * next_log_probs
+                    # the reward PPO receives, f - w log pi, and its two parts (logging only)
+                    reward_metrics = {"reward/airl_reward": airl_reward, "reward/f": f_reward, "reward/minus_log_pi": -log_probs}
                     airl_reward = self.env_reward_frac * rewards + (1 - self.env_reward_frac) * airl_reward
                     airl_reward_absorbing_state = (1 - self.env_reward_frac) * airl_reward_absorbing_state # the environment pays no reward in the absorbing state
 
@@ -452,6 +475,7 @@ class AIRL_PPO:
                         )
 
                         policy_state = policy_state.apply_gradients(grads=policy_gradients)
+                        policy_state = policy_state.replace(params=cap_std_dev(policy_state.params, self.max_std_dev))
                         critic_state = critic_state.apply_gradients(grads=critic_gradients)
 
                         metrics["gradients/policy_grad_norm"] = optax.global_norm(policy_gradients)
@@ -469,7 +493,7 @@ class AIRL_PPO:
                     ppo_optimization_metrics["policy/std_dev"] = jnp.mean(jnp.exp(policy_state.params["params"]["policy_logstd"]))
 
                     # Logging
-                    combined_metrics = {**infos, **disc_optimization_metrics, **ppo_optimization_metrics}
+                    combined_metrics = {**infos, **disc_optimization_metrics, **ppo_optimization_metrics, **reward_metrics}
                     combined_metrics = tree.map_structure(lambda x: jnp.mean(x), combined_metrics)
 
                     def callback(carry):
@@ -523,6 +547,12 @@ class AIRL_PPO:
                         "eval/episode_return": jnp.mean(eval_env_state.info["rollout/episode_return"]),
                         "eval/episode_length": jnp.mean(eval_env_state.info["rollout/episode_length"]),
                     }
+                    # task metrics, when the environment reports them (pizza: success, coverage, lift-off, wander cut;
+                    # ball balancing: ball-goal distance, ball lost)
+                    for name in ("is_success", "success_clean", "coverage", "lifted", "wandered_off",
+                                 "goal_dist", "goal_dist_2nd_half", "ball_lost"):
+                        if f"rollout/{name}" in eval_env_state.info:
+                            eval_metrics[f"eval/{name}"] = jnp.mean(eval_env_state.info[f"rollout/{name}"])
 
                     def callback(metrics_and_global_step):
                         metrics, combined_learning_iteration_step = metrics_and_global_step
@@ -538,9 +568,17 @@ class AIRL_PPO:
 
                 # Saving
                 if self.save_model:
-                    def save_with_check(policy_state, critic_state, discriminator_state):
+                    eval_return_for_save = eval_metrics["eval/episode_return"] if self.evaluation_active else jnp.asarray(-jnp.inf)
+
+                    def save_with_check(policy_state, critic_state, discriminator_state, eval_return):
+                        # latest.model at every save; best.model when eval/episode_return reaches a new high (as TRIRL-SPR and the PPO baseline)
                         self.save(policy_state, critic_state, discriminator_state)
-                    jax.debug.callback(save_with_check, policy_state, critic_state, discriminator_state)
+                        current = float(np.asarray(eval_return))
+                        if self.evaluation_active and current > self.best_eval_return:
+                            self.best_eval_return = current
+                            self.save(policy_state, critic_state, discriminator_state, file_name=self.best_model_file_name)
+                            rlx_logger.info(f"[save-best] new best eval/episode_return={current:.4f} -> {self.best_model_file_name}")
+                    jax.debug.callback(save_with_check, policy_state, critic_state, discriminator_state, eval_return_for_save)
 
                 
                 return (policy_state, critic_state, discriminator_state, (expert_states, expert_actions, expert_next_states, expert_absorbing), env_state, key), None
@@ -590,7 +628,8 @@ class AIRL_PPO:
             rlx_logger.info("└" + "─" * 31 + "┴" + "─" * 16 + "┘")
 
 
-    def save(self, policy_state, critic_state, discriminator_state):
+    def save(self, policy_state, critic_state, discriminator_state, file_name=None):
+        file_name = file_name or self.latest_model_file_name
         checkpoint = {
             "policy": policy_state,
             "critic": critic_state,
@@ -600,12 +639,12 @@ class AIRL_PPO:
         self.latest_model_checkpointer.save(f"{self.save_path}/tmp", checkpoint, save_args=save_args)
         with open(f"{self.save_path}/tmp/config_algorithm.json", "w") as f:
             json.dump(self.config.algorithm.to_dict(), f)
-        shutil.make_archive(f"{self.save_path}/{self.latest_model_file_name}", "zip", f"{self.save_path}/tmp")
-        os.rename(f"{self.save_path}/{self.latest_model_file_name}.zip", f"{self.save_path}/{self.latest_model_file_name}")
+        shutil.make_archive(f"{self.save_path}/{file_name}", "zip", f"{self.save_path}/tmp")
+        os.rename(f"{self.save_path}/{file_name}.zip", f"{self.save_path}/{file_name}")
         shutil.rmtree(f"{self.save_path}/tmp")
 
         if self.track_wandb:
-            wandb.save(f"{self.save_path}/{self.latest_model_file_name}", base_path=self.save_path)
+            wandb.save(f"{self.save_path}/{file_name}", base_path=self.save_path)
     
 
     def load(config, train_env, eval_env, run_path, writer, explicitly_set_algorithm_params):
