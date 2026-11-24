@@ -1,0 +1,8 @@
+from rl_x.algorithms.algorithm_manager import extract_algorithm_name_from_file, register_algorithm
+from trust_region_irl.algorithms.diffusion_policy.flax_full_jit.diffusion_policy import DiffusionPolicy
+from trust_region_irl.algorithms.diffusion_policy.flax_full_jit.default_config import get_config
+from trust_region_irl.algorithms.diffusion_policy.flax_full_jit.general_properties import GeneralProperties
+
+
+DIFFUSION_POLICY_FLAX_FULL_JIT = extract_algorithm_name_from_file(__file__)
+register_algorithm(DIFFUSION_POLICY_FLAX_FULL_JIT, get_config, DiffusionPolicy, GeneralProperties)
