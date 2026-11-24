@@ -13,27 +13,15 @@ from flax.training import orbax_utils
 import orbax.checkpoint
 import optax
 import wandb
-import re
 
 from trust_region_irl.algorithms.airl_ppo.flax_full_jit.general_properties import GeneralProperties
 from trust_region_irl.algorithms.airl_ppo.flax_full_jit.policy import get_policy
 from trust_region_irl.algorithms.airl_ppo.flax_full_jit.critic import get_critic
-from trust_region_irl.algorithms.airl_ppo.flax_full_jit.discriminator import get_discriminator, get_reward_approximator
-from trust_region_irl.algorithms.data_utils import prepare_expert_data, expert_data_spec
+from trust_region_irl.algorithms.airl_ppo.flax_full_jit.discriminator import get_discriminator
+from trust_region_irl.algorithms.airl_ppo.flax_full_jit.data_utils import prepare_expert_data, expert_data_spec
 
 rlx_logger = logging.getLogger("rl_x")
 
-class Batch:
-    def __init__(self, states, next_states, actions, rewards, values, terminations, log_probs, advantages, returns):
-        self.states = states
-        self.next_states = next_states
-        self.actions = actions
-        self.rewards = rewards
-        self.values = values
-        self.terminations = terminations
-        self.log_probs = log_probs
-        self.advantages = advantages
-        self.returns = returns
 
 class AIRL_PPO:
     def __init__(self, config, train_env, eval_env, run_path, writer):
@@ -76,10 +64,8 @@ class AIRL_PPO:
         self.os_shape = self.train_env.single_observation_space.shape
         self.as_shape = self.train_env.single_action_space.shape
         self.horizon = self.train_env.horizon
-        self.dim = np.prod(self.as_shape).item()
-        self.retraining = config.algorithm.retraining
 
-        # AIRL Specific
+        # AIRL Attributes
         self.data_path = config.algorithm.data_path
         self.nr_epochs_disc = config.algorithm.nr_epochs_disc
         self.learning_rate_disc = config.algorithm.learning_rate_disc
@@ -87,9 +73,10 @@ class AIRL_PPO:
         self.handle_absorbing_states = config.algorithm.handle_absorbing_states
         self.gp_lambda = config.algorithm.gp_lambda
         self.gp_alpha = config.algorithm.gp_alpha
-        self.reward_type = config.algorithm.reward_type
-        # self.num_data_samples = int(re.search(r"/(\d+)_episodes/", self.data_path).group(1)) * self.train_env.horizon
-        self.num_data_samples = np.load(self.data_path)["states"].shape[0]
+        self.num_data_samples = prepare_expert_data(self.data_path)["states"].shape[0]
+
+        if self.minibatch_size > self.batch_size:
+            raise ValueError("Minibatch size must not be larger than batch size")
 
         if self.evaluation_and_save_frequency % self.batch_size != 0:
             raise ValueError("Evaluation and save frequency must be a multiple of batch size")
@@ -105,15 +92,15 @@ class AIRL_PPO:
 
         self.policy, self.get_processed_action = get_policy(self.config, self.train_env)
         self.critic = get_critic(self.config, self.train_env)
-        self.discriminator = get_discriminator(config, self.train_env, reward_type=self.reward_type)
+        self.discriminator = get_discriminator(config, self.train_env)
 
         def linear_schedule(count):
             fraction = 1.0 - (count // (self.nr_minibatches * self.nr_epochs)) / self.nr_updates
             return self.learning_rate * fraction
 
         def linear_schedule_disc(count):
-            fraction = 1.0 - (count // (self.nr_minibatches * self.nr_epochs_disc)) / ((self.nr_updates * self.nr_epochs) / self.nr_epochs_disc)
-            return self.learning_rate * fraction
+            fraction = 1.0 - (count // (self.nr_minibatches * self.nr_epochs_disc)) / self.nr_updates
+            return self.learning_rate_disc * fraction
 
         learning_rate = linear_schedule if self.anneal_learning_rate else self.learning_rate
         learning_rate_disc = linear_schedule_disc if self.anneal_learning_rate else self.learning_rate_disc
@@ -121,10 +108,8 @@ class AIRL_PPO:
         self.key, sampling_key = jax.random.split(self.key)
         env_state = self.train_env.reset(reset_key, False)
         action = jnp.array([self.train_env.single_action_space.sample(sampling_key)])
-        log_prob = jnp.log(self.std_dev) * jnp.ones((1, np.prod(self.as_shape).item()))
+        log_prob = jnp.zeros_like(env_state.terminated, dtype=jnp.float32)
         self.H_terminal = jnp.sum(jnp.log(self.train_env.single_action_space.high - self.train_env.single_action_space.low))
-        self.as_high = self.train_env.single_action_space.high[0]
-        self.as_low = self.train_env.single_action_space.low[0]
 
         self.policy_state = TrainState.create(
             apply_fn=self.policy.apply,
@@ -181,13 +166,11 @@ class AIRL_PPO:
             discriminator_state = self.discriminator_state
 
             def multi_learning_and_eval_save_iteration(multi_learning_and_eval_save_iteration_carry, multi_learning_iteration_step):
-                # policy_state, critic_state, env_state, key = multi_learning_and_eval_save_iteration_carry
                 policy_state, critic_state, discriminator_state, \
                 (expert_states, expert_actions, expert_next_states, expert_absorbing), \
                 env_state, key = multi_learning_and_eval_save_iteration_carry
 
                 def learning_iteration(learning_iteration_carry, learning_iteration_step):
-                    # policy_state, critic_state, env_state, key = learning_iteration_carry
                     policy_state, critic_state, discriminator_state, \
                     (expert_states, expert_actions, expert_next_states, expert_absorbing), \
                     env_state, key = learning_iteration_carry
@@ -222,14 +205,9 @@ class AIRL_PPO:
                     states, next_states, actions, rewards, values, terminations, log_probs, old_action_means, old_action_logstd, infos = batch
 
                     """ AIRL Components """
-                    # Compute expert actions' log probability under the current policy
                     def get_log_prob(policy_state, state, action):
                         """
                         Get the log probability of an action given a mean and std.
-                        Args:
-                            policy_state: the current policy's params
-                            state: state at which the passed action was computed
-                            action: action for which log prob needs to be computed
                         """
                         mean, logstd = self.policy.apply(policy_state.params, state)
                         std = jnp.exp(logstd)
@@ -246,18 +224,14 @@ class AIRL_PPO:
 
                         # Gradient penalty on an interpolated sample between the expert and agent
                         alpha = self.gp_alpha
-                        # alpha = jax.random.uniform(rng)
                         gp_lambda = self.gp_lambda
                         interpolated_state = alpha * expert_state + (1 - alpha) * state
                         interpolated_action = alpha * expert_action + (1 - alpha) * action
                         interpolated_next_state = alpha * expert_next_state + (1 - alpha) * next_state
                         interpolated_abs = 0.0 * expert_absorbing # assume interpolated state to be non-absorbing
                         interpolated_log_prob = 0.0 * expert_log_prob # assume that the interpolated action is the expert's action 
-                        grad_state, grad_action, grad_next_state = jax.grad(lambda s, a, sn, ab, log_p: jnp.sum(self.discriminator.apply(discriminator_params, s, a, sn, ab, log_p)), argnums=(0, 1, 2))(interpolated_state, interpolated_action, interpolated_next_state, interpolated_abs, interpolated_log_prob)                
-                        if self.reward_type in ["shaped"]:
-                            grad_norm = jnp.sqrt(jnp.sum(jnp.square(grad_state)) + jnp.sum(jnp.square(grad_next_state)))
-                        elif self.reward_type in ["shaped-sa"]:
-                            grad_norm = jnp.sqrt(jnp.sum(jnp.square(grad_state)) + jnp.sum(jnp.square(grad_action)) + jnp.sum(jnp.square(grad_next_state)))
+                        grad_state, grad_action, grad_next_state = jax.grad(lambda s, a, sn, ab, log_p: jnp.sum(self.discriminator.apply(discriminator_params, s, a, sn, ab, log_p)), argnums=(0, 1, 2))(interpolated_state, interpolated_action, interpolated_next_state, interpolated_abs, interpolated_log_prob)
+                        grad_norm = jnp.sqrt(jnp.sum(jnp.square(grad_state)) + jnp.sum(jnp.square(grad_next_state)))
                         gp = (grad_norm - 1.0) ** 2
 
                         bce_loss = bce_agent + bce_expert + gp_lambda * gp
@@ -274,19 +248,18 @@ class AIRL_PPO:
                     batch_log_probs = log_probs.reshape(-1)
 
                     # Expert batch
-                    key, shuffle_key = jax.random.split(key)
-                    # sample with replacement so the batch has batch_size rows even if the expert data is smaller
-                    expert_idx = jax.random.randint(shuffle_key, (self.batch_size,), 0, expert_states.shape[0])
-                    batch_expert_states = expert_states[expert_idx]
-                    batch_expert_actions = expert_actions[expert_idx]
+                    key, expert_key = jax.random.split(key)
+                    expert_indices = jax.random.randint(expert_key, (self.batch_size,), 0, expert_states.shape[0])
+                    batch_expert_states = expert_states[expert_indices]
+                    batch_expert_actions = expert_actions[expert_indices]
                     expert_labels = jnp.ones((self.batch_size, 1), dtype=jnp.float32)
                     rollout_labels = jnp.zeros((self.batch_size, 1), dtype=jnp.float32)
 
                     batch_next_states = next_states.reshape((-1,) + self.os_shape)
                     batch_absorbing = terminations.reshape(-1)
 
-                    batch_expert_next_states = expert_next_states[expert_idx]
-                    batch_expert_absorbing = expert_absorbing[expert_idx]
+                    batch_expert_next_states = expert_next_states[expert_indices]
+                    batch_expert_absorbing = expert_absorbing[expert_indices]
                     batch_expert_log_probs = get_log_prob(policy_state, batch_expert_states, batch_expert_actions)
 
                     vmap_airl_loss_fn = jax.vmap(airl_loss_fn, in_axes=(None, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), out_axes=0)
@@ -297,6 +270,7 @@ class AIRL_PPO:
                     key, subkey = jax.random.split(key)
                     batch_indices_disc = jnp.tile(jnp.arange(self.batch_size), (self.nr_epochs_disc, 1))
                     batch_indices_disc = jax.random.permutation(subkey, batch_indices_disc, axis=1, independent=True)
+                    batch_indices_disc = batch_indices_disc[:, :self.nr_minibatches * self.minibatch_size]
                     batch_indices_disc = batch_indices_disc.reshape((self.nr_epochs_disc * self.nr_minibatches, self.minibatch_size))
 
                     def airl_minibatch_update(carry, minibatch_indices_disc):
@@ -345,23 +319,26 @@ class AIRL_PPO:
                                 terminations.flatten(),
                                 log_probs.flatten(),
                                 ),
-                                self.discriminator_state,
+                                discriminator_state,
                                 ).reshape(rewards.shape)
 
                     if self.handle_absorbing_states:
-                        next_log_probs = (1/(self.as_high - self.as_low)) * jnp.ones_like(log_probs)
-                        airl_reward_absorbing_state = get_reward((next_states.reshape((-1,) + self.os_shape), # next state
-                                    actions.reshape((-1,) + self.as_shape), # next actions don't matter in absorbing states
-                                    next_states.reshape((-1,) + self.os_shape), # next next states are the same as next states if in absorbing state
-                                    jnp.ones_like(terminations.flatten()), # absorbing is true
+                        next_log_probs = -self.H_terminal * jnp.ones_like(log_probs)
+                        airl_reward_absorbing_state = get_reward((next_states.reshape((-1,) + self.os_shape),
+                                    actions.reshape((-1,) + self.as_shape),
+                                    next_states.reshape((-1,) + self.os_shape),
+                                    jnp.ones_like(terminations.flatten()),
                                     next_log_probs.reshape(-1,),
                                     ),
-                                    self.discriminator_state,
+                                    discriminator_state,
                                     ).reshape(rewards.shape)
                     else:
                         airl_reward_absorbing_state = jnp.asarray(0.0)
-                    
-                    
+
+                    airl_reward = self.env_reward_frac * rewards + (1 - self.env_reward_frac) * airl_reward
+                    airl_reward_absorbing_state = (1 - self.env_reward_frac) * airl_reward_absorbing_state # the environment pays no reward in the absorbing state
+
+
                     """ PPO """
 
                     # Calculating advantages and returns
@@ -412,7 +389,6 @@ class AIRL_PPO:
                         new_log_prob = -0.5 * ((action_b - action_mean) / action_std) ** 2 - 0.5 * jnp.log(2.0 * jnp.pi) - action_logstd
                         new_log_prob = new_log_prob.sum(1)
                         entropy = action_logstd + 0.5 * jnp.log(2.0 * jnp.pi * jnp.e)
-                        entropy = self.entropy_coef * entropy # scaling to reduce critic loss
 
                         logratio = new_log_prob - log_prob_b
                         ratio = jnp.exp(logratio)
@@ -456,6 +432,7 @@ class AIRL_PPO:
                     key, subkey = jax.random.split(key)
                     batch_indices = jnp.tile(jnp.arange(self.batch_size), (self.nr_epochs, 1))
                     batch_indices = jax.random.permutation(subkey, batch_indices, axis=1, independent=True)
+                    batch_indices = batch_indices[:, :self.nr_minibatches * self.minibatch_size]
                     batch_indices = batch_indices.reshape((self.nr_epochs * self.nr_minibatches, self.minibatch_size))
 
                     def ppo_minibatch_update(carry, minibatch_indices):
@@ -624,6 +601,7 @@ class AIRL_PPO:
         with open(f"{self.save_path}/tmp/config_algorithm.json", "w") as f:
             json.dump(self.config.algorithm.to_dict(), f)
         shutil.make_archive(f"{self.save_path}/{self.latest_model_file_name}", "zip", f"{self.save_path}/tmp")
+        os.rename(f"{self.save_path}/{self.latest_model_file_name}.zip", f"{self.save_path}/{self.latest_model_file_name}")
         shutil.rmtree(f"{self.save_path}/tmp")
 
         if self.track_wandb:
@@ -661,162 +639,26 @@ class AIRL_PPO:
         return model
 
 
-    def make_reward_function(self):
-        discriminator = self.discriminator
-        discriminator_params = self.discriminator_state.params
-        entropy_coef = self.entropy_coef
-
-        def reward_function(state, action, next_state, absorbing, log_prob):
-            # feature = feature_from_transition(state, action)
-            reward = discriminator.apply(discriminator_params, state, action, next_state, absorbing, log_prob, shaping=0)
-            return entropy_coef * reward # scaling to reduce critic loss (has no effect on solution since the same is also applied to the entropy)
-
-        reward_function = jax.vmap(reward_function, in_axes=(0, 0, 0, 0, 0), out_axes=0)
-        return reward_function
-
-
     def test(self, episodes):
-        if self.retraining:
-            self.retrain_ppo()
-        else:
-            self.test_irl(episodes)
+        rlx_logger.info("Testing runs infinitely. The episodes parameter is ignored.")
 
+        @jax.jit
+        def rollout(env_state, key):
+            # key, subkey = jax.random.split(key)
+            action_mean, action_logstd = self.policy.apply(self.policy_state.params, env_state.next_observation)
+            # action_std = jnp.exp(action_logstd)
+            action = action_mean # + action_std * jax.random.normal(subkey, shape=action_mean.shape)
+            processed_action = self.get_processed_action(action)
+            env_state = self.train_env.step(env_state, processed_action)
+            return env_state, key
 
-    def retrain_ppo(self):
-        from trust_region_irl.algorithms.ppo_retraining.ppo_retraining import PPO_RETRAINING
-        self.config.runner.track_tb = True
-        self.config.runner.track_wandb = True
-        self.config.runner.track_console = True
-        run_name = f"{self.config.runner.run_name}_ppo_retraining"
-        run_path = f"runs/{self.config.runner.project_name}/{self.config.runner.exp_name}/{run_name}"
-        run_path = os.path.abspath(run_path)
-        if self.config.runner.save_model or self.config.runner.track_tb or self.config.runner.track_wandb:
-            os.makedirs(run_path, exist_ok=True)
-
-        if self.config.runner.track_wandb:
-            import wandb
-            wandb.init(
-                entity=self.config.runner.wandb_entity,
-                project=self.config.runner.project_name,
-                group=self.config.runner.exp_name,
-                name=run_name,
-                notes=self.config.runner.notes,
-                sync_tensorboard=True,
-                config=self.config.to_dict(),
-                monitor_gym=True,
-                save_code=True,
-            )
-
-        reward_function = self.make_reward_function()
-
-        writer = None
-        if self.config.runner.track_tb:
-            from torch.utils.tensorboard import SummaryWriter
-            writer = SummaryWriter(run_path)
-            all_config_items = self.config.runner.items() + self.config.algorithm.items() + self.config.environment.items()
-            writer.add_text(
-                "hyperparameters",
-                "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in all_config_items])),
-            )
-
-        model = PPO_RETRAINING(self.config, self.train_env, self.eval_env, run_path, writer, reward_function)
-
-        try:
-            model.train()
-        finally:
-            self.train_env.close()
-            self.eval_env.close()
-            if self.config.runner.track_tb:
-                writer.close()
-            if self.config.runner.track_wandb:
-                wandb.finish()
-
-
-    def test_irl(self, episodes):
-
-        def visualize():
-            rlx_logger.info("Testing runs infinitely. The episodes parameter is ignored.")
-
-            @jax.jit
-            def rollout(env_state, key):
-                action_mean, action_logstd = self.policy.apply(self.policy_state.params, env_state.next_observation)
-                action = action_mean # + action_std * jax.random.normal(subkey, shape=action_mean.shape)
-                processed_action = self.get_processed_action(action)
-                env_state = self.train_env.step(env_state, processed_action)
-                return env_state, key
-
-            self.key, subkey = jax.random.split(self.key)
-            reset_keys = jax.random.split(subkey, self.nr_envs)
-            env_state = self.train_env.reset(reset_keys, True)
-            while True:
-                env_state, self.key = rollout(env_state, self.key)
-                if self.render:
-                    env_state = self.train_env.render(env_state)
-
-        def evaluate():
-            rlx_logger.info("Running and saving episodes.")
-            nr_steps = 1000
-            batch = Batch(
-                states=np.zeros((1, nr_steps, self.nr_envs) + self.os_shape),
-                next_states=np.zeros((1, nr_steps, self.nr_envs) + self.os_shape),
-                actions=np.zeros((1, nr_steps, self.nr_envs) + self.as_shape),
-                rewards=np.zeros((1, nr_steps, self.nr_envs)),
-                terminations=np.zeros((1, nr_steps, self.nr_envs)),
-
-                values=np.zeros((1, nr_steps, self.nr_envs)),
-                log_probs=np.zeros((1, nr_steps, self.nr_envs)),
-                advantages=np.zeros((1, nr_steps, self.nr_envs)),
-                returns=np.zeros((1, nr_steps, self.nr_envs)),
-            )
-
-            episode_return = jnp.zeros((self.nr_envs))
-            self.key, subkey = jax.random.split(self.key)
-            reset_keys = jax.random.split(subkey, self.nr_envs)
-            env_state = self.train_env.reset(reset_keys, True)
-
-            for step in range(nr_steps):
-                batch.states[0, step] = env_state.next_observation
-
-                # step
-                action_mean, action_logstd = self.policy.apply(self.policy_state.params, env_state.next_observation)
-                action = action_mean
-                processed_action = self.get_processed_action(action)
-                env_state = self.train_env.step(env_state, processed_action)
-
-                batch.next_states[0, step] = env_state.actual_next_observation
-                batch.actions[0, step] = processed_action
-                batch.rewards[0, step] = env_state.reward
-                batch.terminations[0, step] = env_state.terminated
-                episode_return += env_state.reward
-
-                if self.render:
-                    env_state = self.train_env.render(env_state)
-                
-            mean_episode_return = episode_return.mean()
-            rlx_logger.info(f"Mean Episode Return: {mean_episode_return}") 
-
-
-            def flatten_and_prune(arr):
-                flat = arr.reshape(-1, arr.shape[-1])
-                nan_mask = ~np.isnan(flat).any(axis=1)
-                return flat[nan_mask]
-
-            exp_states = flatten_and_prune(batch.states)
-            exp_actions = flatten_and_prune(batch.actions)
-            exp_next_states = flatten_and_prune(batch.next_states)            
-            exp_absorbing = flatten_and_prune(batch.terminations).flatten()
-            exp_rewards = flatten_and_prune(batch.rewards).flatten()
-
-            print(f"save path: {self.save_path}")
-            print(f"states shape: {exp_states.shape}")
-            print(f"actions shape: {exp_actions.shape}")
-            print(f"rewards shape: {exp_rewards.shape}")
-            print(f"absorbing shape: {exp_absorbing.shape}")
-            np.savez(f"{self.save_path}/expert_dataset_Humanoid-v5_{self.nr_envs}_PPONew", states=exp_states, actions=exp_actions, 
-                next_states=exp_next_states, absorbing=exp_absorbing, rewards=exp_rewards)
-
-
-        visualise()
+        self.key, subkey = jax.random.split(self.key)
+        reset_keys = jax.random.split(subkey, self.nr_envs)
+        env_state = self.train_env.reset(reset_keys, True)
+        while True:
+            env_state, self.key = rollout(env_state, self.key)
+            if self.render:
+                env_state = self.train_env.render(env_state)
 
 
     def general_properties():
