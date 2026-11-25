@@ -256,7 +256,7 @@ cd experiments
 python experiment.py --algorithm.name=airl_ppo.flax_full_jit \
   --algorithm.data_path=../trirl_dataset/rl_expert/pizza_dr_demos_100.npz \
   --algorithm.reward_input=embodiment-free --algorithm.handle_absorbing_states=False --algorithm.std_dev=0.4 \
-  --algorithm.nr_disc_steps=3 --algorithm.learning_rate_disc=1.7e-4 --algorithm.max_grad_norm=1.0 --algorithm.log_pi_weight=0.01 \
+  --algorithm.nr_disc_steps=3 --algorithm.learning_rate_disc=1.7e-4 --algorithm.max_grad_norm=1.0 --algorithm.log_pi_weight=0.03 \
   --algorithm.total_timesteps=500e6 --algorithm.evaluation_and_save_frequency=2048000 \
   --environment.name=pizza_dr_mjx --environment.impl=warp --environment.nr_envs=4096 \
   --runner.mode=train --runner.save_model=True --runner.track_console=True
@@ -265,8 +265,11 @@ python experiment.py --algorithm.name=airl_ppo.flax_full_jit \
 With the RL-X default (10 passes over the batch: 800 discriminator steps per iteration with 4096 environments and 10
 steps per rollout) the discriminator separates agent and expert samples almost perfectly on pizza within about 2M
 steps, so the command uses 3 steps per iteration. With the default `log_pi_weight=1` the policy std then still grows
-without bound: actions are clipped to [-1, 1], so a larger std raises -log pi at no cost. `log_pi_weight=0.01` keeps it
-stable. These are the settings of the pizza comparison runs.
+without bound: actions are clipped to [-1, 1], so a larger std raises -log pi at no cost. A weight of 0.1 or less keeps
+the std below about 1, but training is still not stable: coverage rises, then falls back and oscillates. Mean coverage
+after 50M of 100M steps (seed 0): 0.30 / 0.39 / 0.14 with `log_pi_weight` 0.01 / 0.03 / 0.1, and 0.19 with weight 1 and
+`max_std_dev=1`. A 500M run with 0.01 (seed 1) peaked at 0.53 after 18M steps and averaged 0.07 after 50M. The command
+uses 0.03, the best of these; these are the settings for the pizza comparison.
 
 ### Diffusion Policy (`diffusion_policy.flax_full_jit`)
 
@@ -281,10 +284,16 @@ where it differs: [README](../trust_region_irl/algorithms/diffusion_policy/READM
 cd experiments
 python experiment.py --algorithm.name=diffusion_policy.flax_full_jit \
   --algorithm.data_path=../trirl_dataset/rl_expert/pizza_dr_demos_100.npz \
-  --algorithm.n_action_steps=8 --algorithm.total_gradient_steps=200000 --algorithm.evaluation_frequency=50000 \
-  --environment.name=pizza_dr_mjx --environment.impl=jax --environment.nr_envs=512 \
+  --algorithm.n_action_steps=1 --algorithm.total_gradient_steps=50000 --algorithm.evaluation_frequency=50000 \
+  --environment.name=pizza_dr_mjx --environment.impl=warp --environment.nr_envs=512 \
   --runner.mode=train --runner.save_model=True --runner.track_console=True
 ```
+
+These are the settings for the pizza comparison. With 100 demos, coverage falls with longer training although the
+training loss keeps decreasing: after 50k / 100k / 200k steps it is 0.69 / 0.62 / 0.60 with `n_action_steps=1` and
+0.65 / 0.57 / 0.55 with `n_action_steps=8` (seed 0, 512 episodes). The comparison reports coverage first, so the command
+trains 50k steps with `n_action_steps=1`; `n_action_steps=8` has the higher success rate (0.48 against 0.39 on the same
+512 pizzas). Five seeds with the command reach coverage 0.69 ± 0.02.
 
 | Option | Default | Meaning |
 |---|---|---|
