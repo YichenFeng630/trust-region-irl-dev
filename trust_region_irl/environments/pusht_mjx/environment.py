@@ -116,8 +116,9 @@ class PushT:
 
     def __init__(self, render, horizon=250, reward_style="dense",
                  success_threshold=0.1, feature_fn="base", random_TPos = False,
-                 impl="jax", nr_envs=64, contacts_per_env=64, ls_iterations=None):
+                 impl="jax", nr_envs=64, contacts_per_env=64, ls_iterations=None, spawn_radius=0.15):
         self.random_TPos = random_TPos
+        self.spawn_radius = spawn_radius  # m, random start poses: maximum distance of the T origin from the goal
         self.horizon = horizon
         self.reward_style = reward_style
         self.success_threshold = success_threshold
@@ -316,6 +317,7 @@ class PushT:
         info = {
             "rollout/episode_return": 0.0,
             "rollout/episode_length": 0,
+            "rollout/is_success": 0.0,
             "env_info/pos_err": 0.0,
             "env_info/orient_err": 0.0,
             "env_info/is_success": 0.0,
@@ -352,7 +354,7 @@ class PushT:
                 block_angle = self.preset_block_poses[preset_idx][2]
 
             else:
-                SPAWN_RADIUS = 0.15  # m, maximum distance of the T origin from the goal
+                SPAWN_RADIUS = self.spawn_radius  # m, maximum distance of the T origin from the goal
                 EE_SPHERE_RADIUS = 0.015 # m, geom "ee" on body ee_frame
                 EE_CLEARANCE = 0.02 # m, minimum gap between the T surface and the end-effector sphere
                 MAX_TRIES = 32 # redraws before falling back to a known-safe pose
@@ -476,6 +478,8 @@ class PushT:
         log_done = terminated | at_horizon
         state.info["rollout/episode_return"] = jnp.where(log_done, state.info_episode_store["episode_return"], state.info["rollout/episode_return"])
         state.info["rollout/episode_length"] = jnp.where(log_done, state.info_episode_store["episode_length"], state.info["rollout/episode_length"])
+        # success of the last completed episode (1 if it ended by reaching the goal), read by the evaluations as eval/is_success
+        state.info["rollout/is_success"] = jnp.where(log_done, terminated.astype(jnp.float32), state.info["rollout/is_success"])
 
         def when_done(_):
             start_state = self._reset(state)

@@ -16,7 +16,8 @@ def create_train_and_eval_env(config):
                       success_threshold=success_threshold,
                       impl=getattr(config.environment, "impl", "jax"), nr_envs=config.environment.nr_envs,
                       contacts_per_env=getattr(config.environment, "contacts_per_env", 64),
-                      ls_iterations=getattr(config.environment, "ls_iterations", 0) or None)
+                      ls_iterations=getattr(config.environment, "ls_iterations", 0) or None,
+                      spawn_radius=getattr(config.environment, "spawn_radius", 0.15))
     train_env.general_properties = GeneralProperties
 
     if config.environment.copy_train_env_for_eval:
@@ -26,7 +27,8 @@ def create_train_and_eval_env(config):
                      success_threshold=success_threshold,
                      impl=getattr(config.environment, "impl", "jax"), nr_envs=config.environment.nr_envs,
                      contacts_per_env=getattr(config.environment, "contacts_per_env", 64),
-                     ls_iterations=getattr(config.environment, "ls_iterations", 0) or None)
+                     ls_iterations=getattr(config.environment, "ls_iterations", 0) or None,
+                     spawn_radius=getattr(config.environment, "spawn_radius", 0.15))
     eval_env.general_properties = GeneralProperties
 
     return train_env, eval_env

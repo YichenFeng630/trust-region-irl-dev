@@ -5,7 +5,7 @@ environment) for STEPS control steps, through the same actor as the evaluation s
 action chunk every n_action_steps steps, so its cost is averaged over the chunk). The first run includes the JIT
 compilation; the second is timed while nvidia-smi records GPU use. Writes OUT_DIR/bench_policy.json and gpu_*.csv.
 
-    python scripts/gpu_cost/bench_policy.py OUT_DIR {pizza|balance} CKPT [CKPT ...] [--n-envs 512] [--steps 800]
+    python scripts/gpu_cost/bench_policy.py OUT_DIR {pizza|balance|pusht} CKPT [CKPT ...] [--n-envs 512] [--steps 800]
 """
 import argparse
 import json
@@ -21,7 +21,7 @@ from trust_region_irl.gpu_usage import GpuUsage
 
 parser = argparse.ArgumentParser()
 parser.add_argument("out_dir")
-parser.add_argument("env", choices=["pizza", "balance"])
+parser.add_argument("env", choices=["pizza", "balance", "pusht"])
 parser.add_argument("ckpts", nargs="+")
 parser.add_argument("--n-envs", type=int, default=512)
 parser.add_argument("--steps", type=int, default=None, help="control steps (default: the environment's horizon)")
@@ -34,9 +34,12 @@ OUT = Path(args.out_dir); OUT.mkdir(parents=True, exist_ok=True)
 if args.env == "pizza":
     from trust_region_irl.environments.pizza_dr_mjx.environment import PizzaSpreadDR
     env = PizzaSpreadDR(render=False, nr_envs=args.n_envs, impl=args.impl)
-else:
+elif args.env == "balance":
     from trust_region_irl.environments.balance_fr3_mjx.environment import BalanceFR3
     env = BalanceFR3(render=False, nr_envs=args.n_envs, impl=args.impl)
+else:
+    from trust_region_irl.environments.pusht_mjx.environment import PushT
+    env = PushT(render=False, random_TPos=True, spawn_radius=0.20, nr_envs=args.n_envs, impl=args.impl)
 steps = args.steps or env.horizon
 obs = jax.block_until_ready(env.reset(jax.random.split(jax.random.PRNGKey(args.seed), args.n_envs), True).next_observation)
 no_reset = jnp.zeros(args.n_envs, bool)

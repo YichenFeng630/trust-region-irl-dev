@@ -13,6 +13,7 @@ def get_config(environment_name):
     config.copy_train_env_for_eval = True
     config.feature_fn = "base"  # IRL feature basis: base | base_rbf | base_without_ctrl | pos_ort | state_action
     config.random_TPos = False
+    config.spawn_radius = 0.15       # m, random_TPos: maximum distance of the T origin from the goal
     config.impl = "jax"              # MJX backend: jax | warp (warp needs the trirl_warp36 conda env: MuJoCo 3.6, CUDA 12)
     config.contacts_per_env = 64     # warp only: contact slots per env in the shared contact pools (raise for contact-heavy tasks)
     config.ls_iterations = 0         # >0: override the solver linesearch iterations (0 = keep the XML value)

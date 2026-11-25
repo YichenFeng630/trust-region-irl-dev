@@ -1,6 +1,7 @@
 """Summarise evaluation results over seeds: one row per method, the value per seed, mean and standard deviation.
 
-Reads the metrics.json files written by scripts/pizza/plot_policy_paths.py and scripts/balance/eval_policies.py.
+Reads the metrics.json files written by scripts/pizza/plot_policy_paths.py, scripts/balance/eval_policies.py and
+scripts/pusht/eval_policies.py.
 Their entries are named "<run>/<latest|best>"; the method and the seed are read from the run name, "<method>_seeds<N>"
 (also "<method>_s<N>"), e.g. DP_seeds0, AIRL_seeds1. Writes OUT.md (a table) and OUT.csv (one row per run).
 
@@ -19,6 +20,8 @@ PIZZA_KEYS = ["coverage_with_cut", "success_with_cut", "coverage_final", "succes
               "compute.utilization_mean_pct", "compute.energy_wh"]
 BALANCE_KEYS = ["all.goal_dist_cm_not_lost", "all.goal_dist_2nd_half_cm_not_lost", "all.ball_lost", "all.goal_dist_cm",
                 "compute.ms_per_control_step", "compute.jax_peak_bytes_in_use_mib", "compute.utilization_mean_pct", "compute.energy_wh"]
+PUSHT_KEYS = ["success", "final_pos_err_mean", "final_orient_err_mean", "final_iou_mean", "diverged", "steps_to_success_mean",
+              "compute.ms_per_control_step", "compute.jax_peak_bytes_in_use_mib", "compute.utilization_mean_pct", "compute.energy_wh"]
 RUN = re.compile(r"^(?P<method>.+?)_s(?:eeds?)?(?P<seed>\d+)$")
 
 parser = argparse.ArgumentParser()
@@ -48,7 +51,8 @@ for path in args.metrics:
         rows.append(dict(method=method, seed=seed, run=run, file=path, metrics=m))
 if not rows:
     raise SystemExit(f"no '<run>/{args.checkpoint}' entries in {args.metrics}")
-keys = args.keys or (BALANCE_KEYS if "all" in rows[0]["metrics"] else PIZZA_KEYS)
+first = rows[0]["metrics"]
+keys = args.keys or (BALANCE_KEYS if "all" in first else PUSHT_KEYS if "final_iou_mean" in first else PIZZA_KEYS)
 
 with open(f"{args.out}.csv", "w", newline="") as f:
     w = csv.writer(f)
