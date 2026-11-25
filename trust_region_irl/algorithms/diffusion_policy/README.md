@@ -26,4 +26,4 @@ python experiment.py --algorithm.name=diffusion_policy.flax_full_jit \
   --environment.name=pizza_dr_mjx --environment.impl=jax --environment.nr_envs=512 \
   --runner.mode=train --runner.save_model=True --runner.track_console=True
 ```
-`environment.nr_envs` is the number of evaluation episodes. Evaluation logs the environment's task metrics (`eval/coverage`, `eval/is_success`, ... for pizza; `eval/goal_dist`, `eval/ball_lost` for ball balancing).
+`environment.nr_envs` is the number of evaluation episodes. Evaluation logs the environment's task metrics (`eval/coverage`, `eval/is_success`, ... for pizza; `eval/goal_dist`, `eval/ball_lost` for ball balancing; `eval/is_success` for PushT). With PushT's `curriculum_success` in the environment options, the evaluation uses the curriculum's last success threshold, as TRIRL-SPR and AIRL do.

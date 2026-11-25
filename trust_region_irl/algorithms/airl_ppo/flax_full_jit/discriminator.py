@@ -13,13 +13,16 @@ def get_discriminator(config, env):
     observation_space_type = env.general_properties.observation_space_type
 
     # reward_input: "observation" = the whole observation; "embodiment-free" = only the environment's
-    # encoder_input_indices (no robot joints), the same input as TRIRL-SPR's byol-embodiment-free reward
+    # encoder_input_indices (no robot joints), the same input as TRIRL-SPR's byol-embodiment-free reward;
+    # "task-based" = observation entries 0-6 (PushT: T position and quaternion), as TRIRL-SPR's byol-task-based-observation
     if config.algorithm.reward_input == "observation":
         input_indices = None
     elif config.algorithm.reward_input == "embodiment-free":
         input_indices = tuple(int(i) for i in env.encoder_input_indices)
+    elif config.algorithm.reward_input == "task-based":
+        input_indices = (0, 1, 2, 3, 4, 5, 6)
     else:
-        raise ValueError(f"Unknown reward_input {config.algorithm.reward_input}, expected 'observation' or 'embodiment-free'")
+        raise ValueError(f"Unknown reward_input {config.algorithm.reward_input}, expected 'observation', 'embodiment-free' or 'task-based'")
 
     if action_space_type == ActionSpaceType.CONTINUOUS and observation_space_type == ObservationSpaceType.FLAT_VALUES:
         return DiscriminatorShaped(config.algorithm.handle_absorbing_states, config.algorithm.gamma, input_indices,

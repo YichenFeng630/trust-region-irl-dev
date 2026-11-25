@@ -1,4 +1,5 @@
-"""Tests for AIRL (trust_region_irl.algorithms.airl_ppo.flax_full_jit) on pizza_dr_mjx.
+"""Tests for AIRL (trust_region_irl.algorithms.airl_ppo.flax_full_jit) on pizza_dr_mjx, and its PushT options (task-based
+reward input, success-threshold curriculum) on pusht_mjx.
 
     python -m pytest tests/test_airl.py            # all, about 4 min on a laptop GPU
     python -m pytest tests/test_airl.py -m "not slow"
@@ -31,12 +32,30 @@ def make_config(data_path, nr_envs=16, **algorithm):
     return config
 
 
-def fake_expert_data(path, n=4000, seed=0):
+def fake_expert_data(path, n=4000, seed=0, obs_dim=OBS):
     rng = np.random.default_rng(seed)
     ab = np.zeros(n, np.float32); ab[799::800] = 1.0
-    np.savez(path, states=rng.normal(size=(n, OBS)).astype(np.float32), actions=rng.uniform(-1, 1, (n, ACT)).astype(np.float32),
-             next_states=rng.normal(size=(n, OBS)).astype(np.float32), absorbing=ab, rewards=np.zeros(n, np.float32))
+    np.savez(path, states=rng.normal(size=(n, obs_dim)).astype(np.float32), actions=rng.uniform(-1, 1, (n, ACT)).astype(np.float32),
+             next_states=rng.normal(size=(n, obs_dim)).astype(np.float32), absorbing=ab, rewards=np.zeros(n, np.float32))
     return path
+
+
+PUSHT_OBS = 24
+
+
+def make_pusht_config(data_path, nr_envs=16, **algorithm):
+    """make_config on pusht_mjx with random start poses within 0.2 m, as in the PushT comparison."""
+    from trust_region_irl.environments.pusht_mjx.default_config import get_config as pusht_env_config
+    config = make_config(data_path, nr_envs, **algorithm)
+    config.environment = pusht_env_config("pusht_mjx")
+    config.environment.nr_envs, config.environment.seed, config.environment.impl = nr_envs, 0, "jax"
+    config.environment.random_TPos, config.environment.spawn_radius = True, 0.2
+    return config
+
+
+def create_pusht_envs(config):
+    from trust_region_irl.environments.pusht_mjx.create_env import create_train_and_eval_env as create_pusht
+    return create_pusht(config)
 
 
 def flat(tree):
@@ -194,3 +213,48 @@ def test_log_pi_weight(tmp_path, log_pi_weight):
         assert abs(m["reward/airl_reward"] - (m["reward/f"] + log_pi_weight * m["reward/minus_log_pi"])) < 1e-4 * (1 + abs(m["reward/f"]))
         assert m["reward/minus_log_pi"] > 0.1   # std 0.4 on 2 actions: -log pi is about 1 on average, so the weight is visible
 
+
+
+def test_reward_input_task_based(tmp_path):
+    """task-based (PushT): g and h read the T pose only (observation 0-6), as TRIRL-SPR's byol-task-based-observation; the
+    end effector and the arm (7-23) do not change the output."""
+    config = make_pusht_config(fake_expert_data(tmp_path / "data.npz", obs_dim=PUSHT_OBS), reward_input="task-based")
+    env, _ = create_pusht_envs(config)
+    disc = get_discriminator(config, env)
+    k = jax.random.split(jax.random.PRNGKey(0), 3)
+    x, xn = jax.random.normal(k[0], (8, PUSHT_OBS)), jax.random.normal(k[1], (8, PUSHT_OBS))
+    a, ab, logp = jnp.zeros((8, ACT)), jnp.zeros(8), jnp.zeros(8)
+    params = disc.init(k[2], x[:1], a[:1], xn[:1], ab[:1], logp[:1])
+    out = jax.vmap(lambda s, sn: disc.apply(params, s, a[0], sn, 0.0, 0.0))
+    assert params["params"]["gnet_dense1"]["kernel"].shape[0] == 7
+    robot = jnp.zeros(PUSHT_OBS).at[7:].set(1.0)
+    base = out(x, xn)
+    assert float(jnp.abs(out(x + robot, xn + robot) - base).max()) == 0.0
+    for i in range(7):
+        task = jnp.zeros(PUSHT_OBS).at[i].set(1.0)
+        assert float(jnp.abs(out(x + task, xn + task) - base).max()) > 1e-6, i
+
+
+@pytest.mark.slow
+def test_success_threshold_curriculum(tmp_path):
+    """PushT's success-threshold curriculum: each training rollout uses its stage's threshold (logged as
+    env/success_threshold), the evaluation always the final one. Thresholds 0 then 10: no training episode can succeed in
+    the first half, every one succeeds on its first step in the second half, and so does every evaluation episode."""
+    data = fake_expert_data(tmp_path / "data.npz", obs_dim=PUSHT_OBS)
+    batch = 16 * 10
+    config = make_pusht_config(data, total_timesteps=batch * 4, evaluation_and_save_frequency=batch * 2, evaluation_active=True,
+                               minibatch_size=80, nr_epochs=1, nr_epochs_disc=1, std_dev=0.4, learning_rate_disc=1e-3,
+                               reward_input="task-based")
+    config.environment.curriculum_success = True
+    config.environment.success_threshold_values, config.environment.success_threshold_fractions = "0.0,10.0", "0.5,0.5"
+    train_env, eval_env = create_pusht_envs(config)
+    model = AIRL_PPO(config, train_env, eval_env, str(tmp_path / "run"), None)
+    logged = []
+    model.log = lambda name, value, step: logged.append((step, name, float(value)))
+    model.save = lambda *a, **k: None
+    model.train()
+    series = lambda name: [v for s, v in sorted((s, v) for s, n, v in logged if n == name)]
+    assert series("env/success_threshold") == [0.0, 0.0, 10.0, 10.0]
+    train_success = series("env_info/is_success")
+    assert train_success[:2] == [0.0, 0.0] and train_success[2:] == [1.0, 1.0]
+    assert series("eval/is_success") == [1.0, 1.0]

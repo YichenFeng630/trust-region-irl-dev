@@ -33,7 +33,7 @@ def get_config(algorithm_name):
     config.gp_lambda = 0.05
     config.gp_alpha = 0.5
     config.handle_absorbing_states = True
-    config.reward_input = "observation"  # observation (whole observation) | embodiment-free (env.encoder_input_indices, no robot joints)
+    config.reward_input = "observation"  # observation (whole observation) | embodiment-free (env.encoder_input_indices, no robot joints) | task-based (observation 0-6: PushT's T pose)
     config.discriminator_uses_action = False  # True: g(s, a) + gamma h(s') - h(s) (shaped-sa in the TRIRL paper code), False: g(s)
     config.max_std_dev = -1.0  # > 0: keep the learnable policy std at or below this value (projected after every update); <= 0: no cap
     config.log_pi_weight = 1.0  # w in the policy reward f - w log pi; the discriminator always uses f - log pi. 1.0 = RL-X / TRIRL paper code; the original AIRL code (Fu et al. 2018, App. D.2) uses an entropy weight of 0.1 on Ant

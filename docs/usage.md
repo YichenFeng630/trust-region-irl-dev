@@ -64,13 +64,15 @@ and velocities (7). The reward input of `byol-embodiment-free` is the first 10 e
 | `ls_iterations` | 0 | if > 0, overrides the solver's line-search iterations |
 | `feature_fn` | base | hand-designed reward features for the feature-based algorithms (`base`, `base_rbf`, `base_without_ctrl`, `pos_ort`, `state_action`); not used by the BYOL reward types |
 | `random_TPos` | False | random start pose of the T instead of the fixed presets |
+| `spawn_radius` | 0.15 | random start poses: maximum distance (m) of the T from the goal |
 | `success_threshold` | 0.05 | success when both position and orientation error are below this (without the curriculum) |
-| `curriculum_success` | False | lower the success threshold during training (trirl_ppo_spr) |
+| `curriculum_success` | False | lower the success threshold during training (trirl_ppo_spr, airl_ppo); the evaluation uses the last value |
 | `success_threshold_values` | 0.5,0.25,0.1,0.05 | the thresholds of the curriculum |
 | `success_threshold_fractions` | 0.2,0.2,0.2,0.4 | the share of training each threshold lasts (must sum to 1) |
 | `render`, `device`, `copy_train_env_for_eval` | False, gpu, True | viewer on/off, JAX device, use the training env for evaluation |
 
-PushT runs with SPR rewards should use `--environment.curriculum_success=True`.
+PushT runs with SPR rewards should use `--environment.curriculum_success=True`. An episode ends at the first success;
+`rollout/is_success` (logged as `eval/is_success`) is 1 if the last finished episode ended at the goal.
 
 ### Pizza spreading (`pizza_dr_mjx`)
 
@@ -240,7 +242,7 @@ added on top of RL-X are off by default, so the defaults behave as RL-X
 
 | Option | Default | Meaning |
 |---|---|---|
-| `reward_input` | observation | `embodiment-free`: g and h read only the environment's `encoder_input_indices`, the same input as TRIRL-SPR's `byol-embodiment-free` reward |
+| `reward_input` | observation | `embodiment-free`: g and h read only the environment's `encoder_input_indices`, the same input as TRIRL-SPR's `byol-embodiment-free` reward; `task-based`: observation entries 0-6 (PushT's T pose), as TRIRL-SPR's `byol-task-based-observation` |
 | `nr_disc_steps` | -1 | > 0: this many discriminator gradient steps per iteration, each on `minibatch_size` agent and expert samples, as `n_disc_epochs` in the TRIRL paper's robot-task code; otherwise `nr_epochs_disc` passes over the whole batch (RL-X) |
 | `discriminator_uses_action` | False | g(s, a) instead of g(s), as `shaped-sa` in the TRIRL paper's code |
 | `max_std_dev` | -1 | > 0: the learnable policy std is projected back to at most this value after every update |
@@ -249,7 +251,9 @@ added on top of RL-X are off by default, so the defaults behave as RL-X
 
 The PPO reward is logged in its two parts, `reward/f` (discriminator) and `reward/minus_log_pi` (entropy term).
 Evaluation logs the environment's task metrics (`eval/coverage`, `eval/is_success`, ... for pizza; `eval/goal_dist`,
-`eval/ball_lost` for ball balancing) and saves `best.model` next to `latest.model`.
+`eval/ball_lost` for ball balancing; `eval/is_success` for PushT) and saves `best.model` next to `latest.model`. With
+PushT's `curriculum_success`, AIRL follows the success-threshold stages as TRIRL-SPR does (`env/success_threshold`) and
+evaluates with the last threshold.
 
 ```bash
 cd experiments
@@ -302,6 +306,9 @@ trains 50k steps with `n_action_steps=1`; `n_action_steps=8` has the higher succ
 | `evaluation_frequency` | 20000 | gradient steps between closed-loop evaluations (also at the last step) |
 | `num_inference_steps` | 100 | DDPM denoising steps per prediction |
 | `batch_size`, `learning_rate` | 256, 1e-4 | as the official config; the network and optimiser settings are its defaults too |
+
+On PushT with `curriculum_success` in the environment options, the evaluation uses the last threshold of the curriculum,
+as for the online methods (Diffusion Policy trains offline, so the curriculum has no other effect).
 
 `latest.model` is written at every evaluation and `best.model` when the evaluation return reaches a new high. A
 checkpoint is about 525 MB (model and EMA copy, float32). Training runs at about 35 gradient steps per second on an
@@ -395,10 +402,11 @@ reproducible; do not set `XLA_FLAGS=--xla_gpu_deterministic_ops=true`, which bre
 |---|---|
 | `scripts/pizza/plot_policy_paths.py OUT CKPT...` | tool paths on 8 pizzas per checkpoint, coverage over time, metrics; marks where a wander cut would end the episode |
 | `scripts/balance/eval_policies.py OUT CKPT... [--expert DATA] [--dynamics k=v ...]` | ball-goal distance and ball loss per goal family, next to zero action and the expert; plots |
+| `scripts/pusht/eval_policies.py OUT CKPT... [--n-eval 512] [--seed 0]` | success rate (first success: position and orientation error both below 0.05), final errors and IoU of the T's from random start poses within 0.2 m; per-rollout CSV with the columns of the PushT evaluation pipeline; block paths and success over time. `--seed 0 --n-eval 10` gives that pipeline's 10 start poses |
 | `scripts/balance/render_policy.py CKPT OUT [--seconds 50] [--expert-raw RAW]` | one video per goal family plus all joined, with the goal path and the ball trail drawn on the plate |
 | `scripts/balance/render_expert.py RAW OUT` | the same videos for BaMPC demos |
 | `scripts/balance/dynamics_sweep.py OUT.json CKPT... [--variants JSON]` | how much each dynamics variant hurts a trained policy, without retraining |
-| `scripts/gpu_cost/bench_policy.py OUT {pizza\|balance} CKPT...` | inference cost of the policy alone (no simulator), per control step, with GPU use |
+| `scripts/gpu_cost/bench_policy.py OUT {pizza\|balance\|pusht} CKPT...` | inference cost of the policy alone (no simulator), per control step, with GPU use |
 | `scripts/evaluation/summarize.py OUT metrics.json...` | one row per method over seeds (mean, std); run names `<method>_seeds<N>` |
 | `scripts/gpu_cost/gpu_monitor.sh OUT_PREFIX CMD...` | runs a command (e.g. a training run) while sampling nvidia-smi, then summarises GPU time, memory and power |
 
@@ -425,8 +433,10 @@ python -m pytest tests -m "not slow"    # quick checks
 python -m pytest tests                  # also short training runs, a few minutes each (a GPU is recommended)
 ```
 
-`tests/test_airl.py` checks that discriminator updates reach the policy, the reward input and the added AIRL options;
-`tests/test_dp.py` overfits a small Diffusion Policy and reloads it; `tests/test_policy_checkpoint.py` checks the actors
+`tests/test_airl.py` checks that discriminator updates reach the policy, the reward inputs and the added AIRL options,
+including PushT's success-threshold curriculum; `tests/test_dp.py` overfits a small Diffusion Policy, reloads it and
+checks the threshold of its PushT evaluation; `tests/test_pusht.py` checks PushT's spawn radius, `rollout/is_success` and
+the IoU of the evaluation script; `tests/test_policy_checkpoint.py` checks the actors
 the evaluation scripts get from `load_actor` (Diffusion Policy action chunks and history, the Gaussian mean action, and
 that the scripts' rollout matches the evaluation inside Diffusion Policy training); `tests/test_gpu_usage.py` checks the
 GPU recording (skipped without nvidia-smi). `tests/test_dp_parity.py` compares every module of the Diffusion Policy port with the official
@@ -456,9 +466,10 @@ scripts/
   slurm/                  cluster jobs (train, retrain, PPO baseline, run any script)
   mjwarp/                 Warp vs JAX backend checks for PushT
   pizza/                  workspace sweep, start table, demos, path plots
+  pusht/                  evaluation of saved policies (success, errors, IoU)
   balance/                BaMPC tools (bampc/), dataset, checks, evaluation, videos, dynamics sweep
   evaluation/             summary of evaluation results over seeds
   gpu_cost/               GPU cost: policy-only inference benchmark, GPU monitor for training runs
-tests/                    pytest checks for AIRL, Diffusion Policy, the evaluation actors and GPU recording
+tests/                    pytest checks for AIRL, Diffusion Policy, the PushT additions, the evaluation actors and GPU recording
 experiments/              experiment.py (entry point); runs/ is created here
 ```

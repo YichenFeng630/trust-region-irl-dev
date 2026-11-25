@@ -79,6 +79,21 @@ class AIRL_PPO:
         self.log_pi_weight = config.algorithm.log_pi_weight
         self.num_data_samples = prepare_expert_data(self.data_path)["states"].shape[0]
 
+        # Success-threshold curriculum of the environment (PushT), as in TRIRL-SPR: the threshold is lowered in stages over
+        # training; the evaluation always uses the final one
+        self.curriculum_success = config.environment.get("curriculum_success", False)
+        if self.curriculum_success:
+            threshold_values = [float(v) for v in config.environment.success_threshold_values.split(",")]
+            threshold_fractions = [float(f) for f in config.environment.success_threshold_fractions.split(",")]
+            if len(threshold_values) != len(threshold_fractions):
+                raise ValueError("success_threshold_values and success_threshold_fractions must have the same number of entries")
+            if abs(sum(threshold_fractions) - 1.0) > 1e-6:
+                raise ValueError(f"success_threshold_fractions must sum to 1, got {sum(threshold_fractions)}")
+            self.success_threshold_values = jnp.array(threshold_values, dtype=jnp.float32)
+            # env step at which each threshold after the first one starts
+            self.success_threshold_boundaries = jnp.array(np.cumsum(threshold_fractions)[:-1] * self.total_timesteps, dtype=jnp.float32)
+            self.final_success_threshold = threshold_values[-1]
+
         if self.minibatch_size > self.batch_size:
             raise ValueError("Minibatch size must not be larger than batch size")
         if self.nr_disc_steps > self.nr_epochs_disc * (self.batch_size // self.minibatch_size):
@@ -184,6 +199,12 @@ class AIRL_PPO:
                     policy_state, critic_state, discriminator_state, \
                     (expert_states, expert_actions, expert_next_states, expert_absorbing), \
                     env_state, key = learning_iteration_carry
+
+                    # Success-threshold curriculum: pick the threshold from the env steps done before this rollout
+                    if self.curriculum_success:
+                        steps_done = ((multi_learning_iteration_step * self.nr_updates_per_multi_learning_iteration) + learning_iteration_step) * self.batch_size
+                        stage = jnp.searchsorted(self.success_threshold_boundaries, steps_done, side="right")
+                        env_state = env_state.replace(success_threshold=jnp.full_like(env_state.success_threshold, self.success_threshold_values[stage]))
 
                     # Acting
                     def single_rollout(single_rollout_carry, _):
@@ -494,6 +515,8 @@ class AIRL_PPO:
 
                     # Logging
                     combined_metrics = {**infos, **disc_optimization_metrics, **ppo_optimization_metrics, **reward_metrics}
+                    if self.curriculum_success:
+                        combined_metrics["env/success_threshold"] = env_state.success_threshold
                     combined_metrics = tree.map_structure(lambda x: jnp.mean(x), combined_metrics)
 
                     def callback(carry):
@@ -540,6 +563,9 @@ class AIRL_PPO:
                     key, reset_key = jax.random.split(key)
                     reset_keys = jax.random.split(reset_key, self.nr_envs)
                     eval_env_state = self.eval_env.reset(reset_keys, True)
+                    if self.curriculum_success:
+                        # fixed final threshold, so eval/is_success and the best-model choice are comparable over training
+                        eval_env_state = eval_env_state.replace(success_threshold=jnp.full_like(eval_env_state.success_threshold, self.final_success_threshold))
                     single_eval_rollout_carry, _ = jax.lax.scan(single_eval_rollout, (policy_state, eval_env_state), jnp.arange(self.horizon))
                     _, eval_env_state = single_eval_rollout_carry
 

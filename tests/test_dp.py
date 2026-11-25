@@ -103,3 +103,38 @@ def test_overfit_one_episode():
     print(f"loss {float(losses[:50].mean()):.3f} -> {float(losses[-50:].mean()):.4f}; action error {before:.3f} -> {after:.4f}")
     assert float(losses[-50:].mean()) < 0.1 * float(losses[:50].mean())
     assert after < 0.05 and after < 0.2 * before
+
+
+@pytest.mark.slow
+def test_pusht_evaluation_uses_the_final_threshold(tmp_path):
+    """With PushT's success-threshold curriculum on in the environment options, the evaluation uses the final threshold, as
+    TRIRL-SPR and AIRL do: thresholds 0 then 10, so every evaluation episode succeeds (rollout/is_success = 1)."""
+    from ml_collections import config_dict
+    from trust_region_irl.algorithms.diffusion_policy.flax_full_jit.default_config import get_config as dp_config
+    from trust_region_irl.environments.pusht_mjx.create_env import create_train_and_eval_env
+    from trust_region_irl.environments.pusht_mjx.default_config import get_config as env_config
+
+    rng = np.random.default_rng(0)
+    data = tmp_path / "demos.npz"
+    ab = np.zeros(150, np.float32); ab[49::50] = 1.0
+    np.savez(data, states=rng.normal(size=(150, 24)).astype(np.float32), actions=rng.uniform(-0.8, 0.8, (150, 2)).astype(np.float32),
+             absorbing=ab)
+    config = config_dict.ConfigDict()
+    config.algorithm, config.environment = dp_config("diffusion_policy.flax_full_jit"), env_config("pusht_mjx")
+    config.runner = config_dict.ConfigDict(dict(save_model=False, track_console=False, track_tb=False, track_wandb=False))
+    config.environment.nr_envs, config.environment.impl, config.environment.random_TPos = 2, "jax", True
+    a = config.algorithm
+    a.data_path, a.batch_size, a.total_gradient_steps, a.evaluation_frequency = str(data), 32, 3, -1
+    a.down_dims, a.diffusion_step_embed_dim, a.lr_warmup_steps, a.num_inference_steps = "32,64,128", 32, 1, 10
+    a.num_train_timesteps = 10
+
+    train_env, eval_env = create_train_and_eval_env(config)
+    assert DiffusionPolicy(config, train_env, eval_env, str(tmp_path / "off"), None).eval_success_threshold is None
+
+    config.environment.curriculum_success = True
+    config.environment.success_threshold_values, config.environment.success_threshold_fractions = "0.0,10.0", "0.5,0.5"
+    train_env, eval_env = create_train_and_eval_env(config)
+    model = DiffusionPolicy(config, train_env, eval_env, str(tmp_path / "on"), None)
+    assert model.eval_success_threshold == 10.0
+    metrics = jax.device_get(model._make_evaluate()(model.state["ema_params"], jax.random.PRNGKey(0)))
+    assert float(metrics["eval/is_success"]) == 1.0

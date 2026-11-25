@@ -62,6 +62,11 @@ class DiffusionPolicy:
         self.os_shape = train_env.single_observation_space.shape
         self.as_shape = train_env.single_action_space.shape
         self.env_horizon = train_env.horizon
+        # PushT's success-threshold curriculum (environment option, used by the online methods): the evaluation uses the
+        # final threshold, as TRIRL-SPR and AIRL do; None = keep the environment's own threshold
+        env_cfg = config.environment
+        self.eval_success_threshold = (float(env_cfg.success_threshold_values.split(",")[-1])
+                                       if env_cfg.get("curriculum_success", False) else None)
 
         # dataset: windows over the demos, normaliser fitted on all of it
         data = np.load(cfg.data_path)
@@ -143,6 +148,8 @@ class DiffusionPolicy:
         def evaluate(ema_params, key):
             key, reset_key = jax.random.split(key)
             env_state = env.reset(jax.random.split(reset_key, self.nr_envs), True)
+            if self.eval_success_threshold is not None:
+                env_state = env_state.replace(success_threshold=jnp.full_like(env_state.success_threshold, self.eval_success_threshold))
             actor_state = actor.init(env_state.next_observation, key)
 
             def step(carry, t):
