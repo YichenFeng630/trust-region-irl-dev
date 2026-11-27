@@ -12,6 +12,8 @@ def get_config(environment_name):
     config.horizon = 200               # steps at 20 Hz (10 s), as the BaMPC demos; fixed, no early termination
     config.impl = "jax"                # MJX backend: jax | warp (MuJoCo 3.6, see requirements.txt)
     config.contacts_per_env = 64       # warp only: contact slots per env in the shared contact pools
+    config.obs_mode = "full"           # full (39, with ball and plate velocities) | positions_history (43, positions now and one step back)
+    config.lost_terminates = False     # True: losing the ball ends the episode as a failure (terminated)
     # dynamics variants for reward-transfer tests (1.0 = nominal BaMPC task)
     config.ball_mass_scale = 1.0       # ball mass and inertia
     config.tilt_gain_scale = 1.0       # IK: commanded plate tilt rate per unit action

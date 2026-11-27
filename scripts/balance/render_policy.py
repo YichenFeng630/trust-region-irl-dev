@@ -33,14 +33,16 @@ parser.add_argument("--n-eval", type=int, default=100)
 parser.add_argument("--impl", default="warp", help="MJX backend: jax | warp")
 parser.add_argument("--seed", type=int, default=2026)
 parser.add_argument("--dynamics", nargs="*", default=[], help="env dynamics variant, e.g. ball_mass_scale=4")
+parser.add_argument("--obs-mode", default="full", help="the env obs_mode the policy was trained with: full | positions_history")
 args = parser.parse_args()
 OUT = Path(args.out_dir); OUT.mkdir(parents=True, exist_ok=True)
 FAMS = ["still", "line", "ellipse", "lissajous", "waypoints"]
 W, H_PX, CAM = 640, 480, "video"
 
-env = BalanceFR3(render=False, nr_envs=args.n_eval, impl=args.impl, horizon=int(round(args.seconds * BalanceFR3.CONTROL_FREQ)),
+env = BalanceFR3(render=False, nr_envs=args.n_eval, impl=args.impl, horizon=int(round(args.seconds * BalanceFR3.CONTROL_FREQ)), obs_mode=args.obs_mode,
                  **{k: float(v) for k, v in (x.split("=") for x in args.dynamics)})
 T = env.horizon
+IX = env.obs_index; BALL, GOAL = IX["ball_pos"].start, IX["goal_pos"].start
 policy = Policy((2,), 1.0, jnp.arange(env.single_observation_space.shape[0]))
 
 
@@ -82,8 +84,8 @@ except OSError:
 
 
 def to_plate(o, idx):
-    """Plate-local position of the world point o[..., idx:idx+3] (plate position 9:12, quaternion wxyz 12:16)."""
-    p, q, x = o[..., 9:12], o[..., 12:16], o[..., idx:idx + 3]
+    """Plate-local position of the world point o[..., idx:idx+3] (plate position and quaternion wxyz from env.obs_index)."""
+    p, q, x = o[..., IX["plate_pos"]], o[..., IX["plate_quat"]], o[..., idx:idx + 3]
     w, v = q[..., :1], -q[..., 1:4]
     d = x - p; t = 2 * np.cross(v, d)
     return d + w * t + np.cross(v, t)
@@ -137,10 +139,10 @@ for f, name in enumerate(FAMS):
         ej = np.where(ex_fam == f)[0]; j = int(ej[np.argsort(ex_dist[ej, T // 2:T].mean(1))[len(ej) // 2]])
         summary[name].update(expert_demo=j, expert_goal_dist_2nd_half_cm=float(100 * ex_dist[j, T // 2:T].mean()))
     frames = []
-    goal_xy, ball_xy = to_plate(obs[:, i], 19)[:, :2], to_plate(obs[:, i], 0)[:, :2]
+    goal_xy, ball_xy = to_plate(obs[:, i], GOAL)[:, :2], to_plate(obs[:, i], BALL)[:, :2]
     for t in range(T):
-        a = frame(qpos[t, i], obs[t, i, 19:22], obs[t, i, 12:16],
-                  [f"{args.label}  |  goal: {name}", f"t {t / env.CONTROL_FREQ:4.1f} s   ball-goal {100 * np.linalg.norm(obs[t, i, 0:2] - obs[t, i, 19:21]):5.1f} cm"],
+        a = frame(qpos[t, i], obs[t, i, GOAL:GOAL + 3], obs[t, i, IX["plate_quat"]],
+                  [f"{args.label}  |  goal: {name}", f"t {t / env.CONTROL_FREQ:4.1f} s   ball-goal {100 * np.linalg.norm(obs[t, i, BALL:BALL + 2] - obs[t, i, GOAL:GOAL + 2]):5.1f} cm"],
                   paths=((goal_xy[::2], (0.1, 0.8, 0.1, 0.9), 0.003), (ball_xy[:t + 1:2], (0.2, 0.45, 0.95, 0.9), 0.002)))
         if WITH_EXPERT:
             b = frame(ex_q[j, t], ex_goal[j, t], ex_goalq[j, t],

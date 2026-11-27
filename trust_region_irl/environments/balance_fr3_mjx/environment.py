@@ -9,10 +9,15 @@ Lissajous (centre + r sin(2 pi f t + phi), peak speed <= 6 cm/s) or ramped waypo
 random point, a new one once it arrived and the ball is within 3 cm).
 
 Action: plate roll/pitch rate in [-1, 1]^2 (x MAX_TILT_VEL rad/s), held for the 5 sim sub-steps (10 ms) of each 50 ms step.
-Observation (39): task part (25, world frame) = ball position, linear and angular velocity; plate position, quaternion and
-angular velocity; goal position and velocity; then the arm joint positions (7) and velocities (7) for the policy and
-critic only (the embodiment-free encoder uses encoder_input_indices = 0..24). Fixed horizon, no early termination (only
-a NaN reset); ball loss and goal distance are metrics.
+Observation (world frame), then the arm joint positions (7) and velocities (7) for the policy and critic only; the
+embodiment-free encoder uses encoder_input_indices, everything but the arm joints. obs_index names the parts.
+  obs_mode="full" (39): ball position, linear and angular velocity; plate position, quaternion and angular velocity;
+      goal position and velocity; arm joints
+  obs_mode="positions_history" (43): ball position, plate position and quaternion, goal position and velocity (16), the
+      previous step's ball position, plate position and quaternion and goal position (13; at reset the current ones),
+      arm joints. No ball or plate velocities: they are inferred from the two steps, as on the real robot.
+Fixed horizon, no early termination (only a NaN reset); ball loss and goal distance are metrics. lost_terminates=True:
+losing the ball ends the episode as a failure (terminated) instead of being a metric only.
 """
 import json
 from functools import partial
@@ -71,8 +76,11 @@ class BalanceFR3:
     OBS_CLIP = 10.0
     BALL_XY_BOX = ((-0.09, -0.092), (0.094, 0.099))   # plate-local ball start range, as BaMPC's scenario bank and the demos
 
-    def __init__(self, render=False, horizon=200, impl="jax", nr_envs=64, contacts_per_env=64,
-                 ball_mass_scale=1.0, tilt_gain_scale=1.0, ik_k_pos_scale=1.0, ik_k_yaw_scale=1.0, ik_damping_scale=1.0):
+    def __init__(self, render=False, horizon=200, impl="jax", nr_envs=64, contacts_per_env=64, obs_mode="full",
+                 ball_mass_scale=1.0, tilt_gain_scale=1.0, ik_k_pos_scale=1.0, ik_k_yaw_scale=1.0, ik_damping_scale=1.0,
+                 lost_terminates=False):
+        assert obs_mode in ("full", "positions_history"), obs_mode
+        self.obs_mode = obs_mode
         # dynamics variants for reward-transfer tests (all 1.0 = BaMPC's nominal task): ball mass (inertia scaled with it,
         # same solid sphere), and the task-space IK: tilt_gain scales the commanded plate tilt rate, k_pos / k_yaw the
         # plate position and yaw hold gains, ik_damping the damped least-squares regulariser
@@ -112,6 +120,7 @@ class BalanceFR3:
         self.k_pos, self.k_yaw, self.ik_damping = float(p["k_pos"]) * ik_k_pos_scale, float(p["k_yaw"]) * ik_k_yaw_scale, float(p["ik_damping"]) * ik_damping_scale
         self.max_tilt_vel = float(p.get("max_tilt_vel", 1.0))
         self.tilt_gain = float(tilt_gain_scale)
+        self.lost_terminates = bool(lost_terminates)
         self.ee_home_pos = jnp.asarray(p["ee_home_pos"], jnp.float32); self.ee_home_quat = jnp.asarray(p["ee_home_quat"], jnp.float32)
         self.rest_z = float(p["ball_local_z"]); self.lost_margin = float(p["lost_margin"])
         self.home_qpos = jnp.asarray(p["home_qpos"], jnp.float32)
@@ -120,9 +129,17 @@ class BalanceFR3:
         self.ball_qadr = int(m.jnt_qposadr[0]); self.ball_dadr = int(m.jnt_dofadr[0])
 
         self.single_action_space = BoxSpace(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
-        self.single_observation_space = BoxSpace(low=-np.inf, high=np.inf, shape=(39,), dtype=np.float32)
-        self.single_features_shape = BoxSpace(low=-np.inf, high=np.inf, shape=(39,), dtype=np.float32)
-        self.encoder_input_indices = tuple(range(0, 25))   # embodiment-free: ball, plate, goal position and velocity; not the arm joints (25:39)
+        if obs_mode == "full":
+            self.obs_index = dict(ball_pos=slice(0, 3), ball_vel=slice(3, 6), ball_angvel=slice(6, 9), plate_pos=slice(9, 12), plate_quat=slice(12, 16),
+                                  plate_angvel=slice(16, 19), goal_pos=slice(19, 22), goal_vel=slice(22, 25), arm_qpos=slice(25, 32), arm_qvel=slice(32, 39))
+        else:
+            self.obs_index = dict(ball_pos=slice(0, 3), plate_pos=slice(3, 6), plate_quat=slice(6, 10), goal_pos=slice(10, 13), goal_vel=slice(13, 16),
+                                  prev_ball_pos=slice(16, 19), prev_plate_pos=slice(19, 22), prev_plate_quat=slice(22, 26), prev_goal_pos=slice(26, 29),
+                                  arm_qpos=slice(29, 36), arm_qvel=slice(36, 43))
+        obs_dim = self.obs_index["arm_qvel"].stop
+        self.single_observation_space = BoxSpace(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
+        self.single_features_shape = BoxSpace(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
+        self.encoder_input_indices = tuple(range(0, self.obs_index["arm_qpos"].start))   # embodiment-free: everything but the arm joints
         self.viewer = None
 
     # ------------------------------------------------------------ control #
@@ -219,15 +236,22 @@ class BalanceFR3:
     def _plate(self, data):
         return data.xpos[self.plate_id], data.xmat[self.plate_id].reshape(3, 3)
 
-    def obs_from(self, data, gl, gv):
-        """Observation from a state and the plate-local goal position/velocity (used by the env and the dataset builder)."""
+    POS_DIM = 13   # positions_history: ball position, plate position and quaternion, goal position (the part repeated as history)
+
+    def obs_from(self, data, gl, gv, prev_pos=None):
+        """Observation from a state and the plate-local goal position/velocity (used by the env and the dataset builder).
+        positions_history: prev_pos is the previous step's first POS_DIM entries (None: the current ones, as at reset)."""
         pp, R = self._plate(data)
         goal_w = pp + R @ jnp.array([gl[0], gl[1], self.rest_z])
         goal_v = R @ jnp.array([gv[0], gv[1], 0.0])
-        ball_v = data.qvel[self.ball_dadr:self.ball_dadr + 6]   # free joint: linear (world), angular
-        plate_w = data.cvel[self.plate_id][0:3]                 # angular velocity (rotational part of the com-based spatial velocity)
-        o = jnp.concatenate([data.xpos[self.ball_id], ball_v, pp, data.xquat[self.plate_id], plate_w, goal_w, goal_v,
-                             data.qpos[self.arm_qposadr], data.qvel[self.arm_dofadr]])
+        arm = [data.qpos[self.arm_qposadr], data.qvel[self.arm_dofadr]]
+        if self.obs_mode == "full":
+            ball_v = data.qvel[self.ball_dadr:self.ball_dadr + 6]   # free joint: linear (world), angular
+            plate_w = data.cvel[self.plate_id][0:3]                 # angular velocity (rotational part of the com-based spatial velocity)
+            o = jnp.concatenate([data.xpos[self.ball_id], ball_v, pp, data.xquat[self.plate_id], plate_w, goal_w, goal_v] + arm)
+        else:
+            pos = jnp.concatenate([data.xpos[self.ball_id], pp, data.xquat[self.plate_id], goal_w])
+            o = jnp.concatenate([pos, goal_v, pos if prev_pos is None else prev_pos] + arm)
         return jnp.clip(jnp.nan_to_num(o, nan=0.0, posinf=self.OBS_CLIP, neginf=-self.OBS_CLIP), -self.OBS_CLIP, self.OBS_CLIP)
 
     def _metrics(self, data, gl):
@@ -239,7 +263,8 @@ class BalanceFR3:
 
     # ------------------------------------------------------------ rollout #
     def _fresh_store(self, g):
-        return {"episode_return": 0.0, "episode_length": 0, "lost": 0.0, "dist_sum": 0.0, "dist_sum_2nd": 0.0, **g}
+        return {"episode_return": 0.0, "episode_length": 0, "lost": 0.0, "dist_sum": 0.0, "dist_sum_2nd": 0.0,
+                "prev_pos": jnp.zeros(self.POS_DIM, jnp.float32), **g}
 
     @partial(jax.vmap, in_axes=(None, 0, None))
     def reset(self, key, eval_mode):
@@ -264,6 +289,7 @@ class BalanceFR3:
         gl, gv = self.goal_local(g, 0.0)
         obs = self.obs_from(data, gl, gv)
         store = self._fresh_store(g)
+        store["prev_pos"] = obs[:self.POS_DIM]   # used by positions_history only
         return state.replace(key=key, data=data, next_observation=obs, actual_next_observation=obs, reward=0.0, terminated=False,
                              truncated=False, info=dict(state.info), info_episode_store=store)
 
@@ -294,8 +320,11 @@ class BalanceFR3:
         diverged = jnp.any(jnp.isnan(data.qpos)) | jnp.any(jnp.isnan(data.qvel))
         at_horizon = store["episode_length"] >= self.horizon
         truncated = at_horizon | diverged
-        done = truncated
-        obs = self.obs_from(obs_data, gl, gv)
+        terminated = lost & self.lost_terminates   # losing the ball as a failure ending
+        truncated = truncated & ~terminated
+        done = terminated | truncated
+        obs = self.obs_from(obs_data, gl, gv, store["prev_pos"] if self.obs_mode == "positions_history" else None)
+        store["prev_pos"] = obs[:self.POS_DIM]
         store["episode_return"] += reward
         state.info.update({"env_info/goal_dist": dist, "env_info/ball_lost": lost.astype(jnp.float32), "env_info/diverged": diverged.astype(jnp.float32),
                            "env_info/goal_speed": jnp.linalg.norm(gv)})
@@ -309,10 +338,10 @@ class BalanceFR3:
 
         def when_done(_):
             s = self._reset(state)
-            return s.replace(actual_next_observation=obs, reward=reward, terminated=False, truncated=truncated)
+            return s.replace(actual_next_observation=obs, reward=reward, terminated=terminated, truncated=truncated)
 
         def when_not_done(_):
-            return state.replace(data=data, next_observation=obs, actual_next_observation=obs, reward=reward, terminated=False, truncated=truncated)
+            return state.replace(data=data, next_observation=obs, actual_next_observation=obs, reward=reward, terminated=terminated, truncated=truncated)
 
         return _select_state(done, when_done(None), when_not_done(None))
 
