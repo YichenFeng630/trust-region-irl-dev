@@ -214,6 +214,32 @@ def test_log_pi_weight(tmp_path, log_pi_weight):
         assert m["reward/minus_log_pi"] > 0.1   # std 0.4 on 2 actions: -log pi is about 1 on average, so the weight is visible
 
 
+@pytest.mark.parametrize("terminal_tail", ["double", "single", "triple"])
+def test_terminal_tail(tmp_path, terminal_tail):
+    """Reward of the absorbing state after an episode ends in s' (GAE adds gamma/(1-gamma) times it plus entropy_coef H_T).
+    double (default, RL-X / dev code): g(s')/(1-gamma) - h(s') + w H_T, so g(s') counts again on top of the
+    gamma/(1-gamma) g(s') in the ending step's own f; single: w H_T only. Other values are refused."""
+    batch = 16 * 10
+    config = make_pusht_config(fake_expert_data(tmp_path / "data.npz", obs_dim=PUSHT_OBS), reward_input="task-based",
+                               log_pi_weight=0.03, terminal_tail=terminal_tail, total_timesteps=batch,
+                               evaluation_and_save_frequency=batch, evaluation_active=False, minibatch_size=80)
+    train_env, eval_env = create_pusht_envs(config)
+    if terminal_tail == "triple":
+        with pytest.raises(ValueError):
+            AIRL_PPO(config, train_env, eval_env, str(tmp_path / "run"), None)
+        return
+    model = AIRL_PPO(config, train_env, eval_env, str(tmp_path / "run"), None)
+    params = model.discriminator_state.params
+    s = jax.random.normal(jax.random.PRNGKey(1), (8, PUSHT_OBS))
+    a = jnp.zeros((8, ACT))
+    mlp = lambda d1, d2, d3, x: d3(jnp.tanh(d2(jnp.tanh(d1(x)))))[..., 0]
+    g = model.discriminator.apply(params, s[:, :7], method=lambda m, x: mlp(m.gnet_dense1, m.gnet_dense2, m.gnet_dense3, x))
+    h = model.discriminator.apply(params, s[:, :7], method=lambda m, x: mlp(m.hnet_dense1, m.hnet_dense2, m.hnet_dense3, x))
+    gamma, w, H_T = config.algorithm.gamma, 0.03, 2 * np.log(2.0)
+    expected = (g / (1 - gamma) - h + w * H_T) if terminal_tail == "double" else w * H_T * jnp.ones(8)
+    assert float(jnp.abs(g / (1 - gamma) - h).max()) > 1e-3   # the two variants differ by this much here
+    assert np.allclose(model.absorbing_state_reward(params, s, a), expected, rtol=1e-4, atol=1e-5)
+
 
 def test_reward_input_task_based(tmp_path):
     """task-based (PushT): g and h read the T pose only (observation 0-6), as TRIRL-SPR's byol-task-based-observation; the

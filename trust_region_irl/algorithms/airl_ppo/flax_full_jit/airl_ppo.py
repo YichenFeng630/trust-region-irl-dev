@@ -77,6 +77,9 @@ class AIRL_PPO:
         self.discriminator_uses_action = config.algorithm.discriminator_uses_action
         self.max_std_dev = config.algorithm.max_std_dev
         self.log_pi_weight = config.algorithm.log_pi_weight
+        self.terminal_tail = config.algorithm.terminal_tail
+        if self.terminal_tail not in ("double", "single"):
+            raise ValueError(f"Unknown terminal_tail {self.terminal_tail}, expected 'double' or 'single'")
         self.num_data_samples = prepare_expert_data(self.data_path)["states"].shape[0]
 
         # Success-threshold curriculum of the environment (PushT), as in TRIRL-SPR: the threshold is lowered in stages over
@@ -358,14 +361,9 @@ class AIRL_PPO:
                                 ).reshape(rewards.shape)
 
                     if self.handle_absorbing_states:
-                        next_log_probs = -self.H_terminal * jnp.ones_like(log_probs)
-                        airl_reward_absorbing_state = get_reward((next_states.reshape((-1,) + self.os_shape),
-                                    actions.reshape((-1,) + self.as_shape),
+                        airl_reward_absorbing_state = self.absorbing_state_reward(discriminator_state.params,
                                     next_states.reshape((-1,) + self.os_shape),
-                                    jnp.ones_like(terminations.flatten()),
-                                    next_log_probs.reshape(-1,),
-                                    ),
-                                    discriminator_state,
+                                    actions.reshape((-1,) + self.as_shape),
                                     ).reshape(rewards.shape)
                     else:
                         airl_reward_absorbing_state = jnp.asarray(0.0)
@@ -375,8 +373,6 @@ class AIRL_PPO:
                     # original AIRL code does (policy reward g plus an entropy bonus of 0.1 on Ant). The discriminator is unchanged.
                     f_reward = airl_reward + log_probs
                     airl_reward = f_reward - self.log_pi_weight * log_probs
-                    if self.handle_absorbing_states:
-                        airl_reward_absorbing_state = airl_reward_absorbing_state + (1.0 - self.log_pi_weight) * next_log_probs
                     # the reward PPO receives, f - w log pi, and its two parts (logging only)
                     reward_metrics = {"reward/airl_reward": airl_reward, "reward/f": f_reward, "reward/minus_log_pi": -log_probs}
                     airl_reward = self.env_reward_frac * rewards + (1 - self.env_reward_frac) * airl_reward
@@ -652,6 +648,20 @@ class AIRL_PPO:
             wandb.log(self.wandb_log_cache, commit=wandb_commit)
         if self.track_console:
             rlx_logger.info("└" + "─" * 31 + "┴" + "─" * 16 + "┘")
+
+
+    def absorbing_state_reward(self, discriminator_params, next_states, actions):
+        """Reward of the absorbing state entered when an episode ends in next_states (batch); GAE's terminal tail is
+        gamma/(1-gamma) * (this + entropy_coef * H_T). The ending step's own f is g(s) + gamma/(1-gamma) g(s') - h(s), so
+        it already holds the absorbing state's reward g(s') for all later steps.
+        "double" (RL-X / dev code): the discriminator's absorbing branch at (s', s') with log pi = -H_T, plus (1 - w)(-H_T),
+        i.e. g(s')/(1-gamma) - h(s') + w H_T: g(s') enters the policy return with weight gamma/(1-gamma) + gamma/(1-gamma)^2,
+        against gamma/(1-gamma) in the discriminator's loss. "single": w H_T, the -w log pi of the uniform absorbing policy."""
+        if self.terminal_tail == "single":
+            return self.log_pi_weight * self.H_terminal * jnp.ones(next_states.shape[0])
+        next_log_probs = -self.H_terminal * jnp.ones(next_states.shape[0])
+        logits = jax.vmap(lambda s, a, lp: self.discriminator.apply(discriminator_params, s, a, s, 1.0, lp))(next_states, actions, next_log_probs)
+        return logits + (1.0 - self.log_pi_weight) * next_log_probs
 
 
     def save(self, policy_state, critic_state, discriminator_state, file_name=None):

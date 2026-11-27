@@ -37,5 +37,6 @@ def get_config(algorithm_name):
     config.discriminator_uses_action = False  # True: g(s, a) + gamma h(s') - h(s) (shaped-sa in the TRIRL paper code), False: g(s)
     config.max_std_dev = -1.0  # > 0: keep the learnable policy std at or below this value (projected after every update); <= 0: no cap
     config.log_pi_weight = 1.0  # w in the policy reward f - w log pi; the discriminator always uses f - log pi. 1.0 = RL-X / TRIRL paper code; the original AIRL code (Fu et al. 2018, App. D.2) uses an entropy weight of 0.1 on Ant
+    config.terminal_tail = "double"  # reward of the absorbing state after an episode ends (handle_absorbing_states): "double" = RL-X / dev code, the discriminator's absorbing branch at (s', s'), so g(s') counts again on top of the gamma/(1-gamma) g(s') already in the step's own f (about 10,000 g(s') in all at gamma 0.99); "single" = only the entropy of the uniform absorbing policy, so g(s') counts once, as in the discriminator's loss (diagnostic, PushT 2026-11-26)
 
     return config
