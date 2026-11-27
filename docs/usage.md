@@ -257,6 +257,7 @@ added on top of RL-X are off by default, so the defaults behave as RL-X
 | `max_std_dev` | -1 | > 0: the learnable policy std is projected back to at most this value after every update |
 | `log_pi_weight` | 1.0 | w in the PPO reward f - w log pi; the discriminator still uses f - log pi. The original AIRL code uses an entropy weight of 0.1 on Ant |
 | `handle_absorbing_states` | True | set False for pizza and for ball balancing without `lost_terminates`: they run a fixed horizon, and the demos mark their last step as absorbing only as an episode boundary. Ball balancing with `lost_terminates=True` keeps it on |
+| `terminal_tail` | double | with absorbing states, the reward of the absorbing state after an episode ends in s'. `double` (RL-X): the discriminator's absorbing branch at (s', s'), so g(s') counts again on top of the gamma/(1-gamma) g(s') already in the ending step's f, about 10,000 g(s') in all at gamma 0.99, against 99 in the discriminator's loss; `single`: only the entropy term of the uniform absorbing policy, so g(s') counts once. A diagnostic: on PushT every tuned run with `double` stayed below 1% success, and with `single` the PushT settings below reach 96% (seed 0) |
 
 The PPO reward is logged in its two parts, `reward/f` (discriminator) and `reward/minus_log_pi` (entropy term).
 Evaluation logs the environment's task metrics (`eval/coverage`, `eval/is_success`, ... for pizza; `eval/goal_dist`,
@@ -284,6 +285,45 @@ after 50M of 100M steps (seed 0): 0.30 / 0.39 / 0.14 with `log_pi_weight` 0.01 /
 `max_std_dev=1`. A 500M run with 0.01 (seed 1) peaked at 0.53 after 18M steps and averaged 0.07 after 50M. The command
 uses 0.03, the best of these; these are the settings for the pizza comparison.
 
+The settings for the PushT comparison take everything shared with TRIRL-SPR from Mohammed's PushT run
+(`spr_k3_cT_oTask_DoRaT`): its demos, its environment (random start poses within 0.2 m, the success-threshold
+curriculum), its PPO settings and its discriminator learning rate and gradient penalty. Tuned on top of these:
+`nr_disc_steps`, `log_pi_weight` and `handle_absorbing_states`.
+
+```bash
+cd experiments
+python experiment.py --algorithm.name=airl_ppo.flax_full_jit \
+  --algorithm.data_path=../trirl_dataset/rl_expert/trirl_expert_data_100_episodes.npz \
+  --algorithm.reward_input=task-based --algorithm.handle_absorbing_states=False \
+  --algorithm.nr_disc_steps=128 --algorithm.log_pi_weight=0.03 \
+  --algorithm.learning_rate=4e-4 --algorithm.anneal_learning_rate=True --algorithm.nr_steps=128 \
+  --algorithm.max_grad_norm=5.0 --algorithm.std_dev=0.4 --algorithm.learning_rate_disc=1e-4 --algorithm.gp_lambda=0.5 \
+  --algorithm.total_timesteps=200e6 --algorithm.evaluation_and_save_frequency=2097152 \
+  --environment.name=pusht_mjx --environment.impl=jax --environment.nr_envs=4096 \
+  --environment.random_TPos=True --environment.spawn_radius=0.2 --environment.feature_fn=base_without_ctrl \
+  --environment.curriculum_success=True \
+  --runner.mode=train --runner.save_model=True --runner.track_console=True
+```
+
+The metric for tuning was the mean `eval/is_success` over the evaluations after 120M steps, where the threshold is 0.05
+(38 evaluations, seed 0 unless stated). An iteration is 524,288 environment steps; 128 discriminator steps per iteration match the
+TRIRL paper's 10 steps per 40,960 environment steps, and 38 match its 3.
+
+- With the command, seeds 0 / 1 / 2: 93.2 / 95.1 / 95.7% (mean 94.7 ± 1.3%). `latest.model` on the 512 start poses of
+  `scripts/pusht/eval_policies.py`: 99.0 / 96.5 / 85.7% (93.8 ± 7.1%); for seed 2, 13% of the rollouts are `diverged`
+  (the T leaves the table or the state turns NaN). Use `latest.model`: `best.model` (highest evaluation return) of seed 2 reaches only 54.9%.
+  The same run with `learning_rate_disc=0` (reward never trained, seed 0) reaches 0%: the policy std grows to 7.
+- With `handle_absorbing_states=True` and `terminal_tail=double` (RL-X): all four runs with 38 or 128 steps and weight
+  0.03 or 0.1 stay below 1%, and so does the RL-X default (10 passes over the batch, weight 1; its std passes 5). The
+  untrained control reaches 96.7%, because its random g(s') near the goal is about +0.004 and is multiplied by about 10^4.
+- With `terminal_tail=single`: 96.2% with 128 steps and weight 0.03, and 9.2% with 38 steps. With weight 0.1 the policy
+  std passes 5 (both step counts).
+
+Without absorbing states the value after an episode ends is 0, as in the original AIRL. The trained g is negative
+everywhere (about -1 near the goal, -1.7 far from it), so ending an episode sooner always pays. On PushT an episode ends
+only on success, so this sign works in the same direction as the task, and part of the success can come from it rather
+than from the shape of g (the termination bias of Kostrikov et al. 2019). TRIRL-SPR on PushT keeps the absorbing states.
+
 ### Diffusion Policy (`diffusion_policy.flax_full_jit`)
 
 A Flax port of the state-based Diffusion Policy with the CNN U-Net (Chi et al. 2023), from the official code
@@ -307,6 +347,27 @@ training loss keeps decreasing: after 50k / 100k / 200k steps it is 0.69 / 0.62 
 0.65 / 0.57 / 0.55 with `n_action_steps=8` (seed 0, 512 episodes). The comparison reports coverage first, so the command
 trains 50k steps with `n_action_steps=1`; `n_action_steps=8` has the higher success rate (0.48 against 0.39 on the same
 512 pizzas). Five seeds with the command reach coverage 0.69 ± 0.02.
+
+For the PushT comparison (Mohammed's demos and environment, as for AIRL above; the network and diffusion settings are
+the official ones):
+
+```bash
+cd experiments
+python experiment.py --algorithm.name=diffusion_policy.flax_full_jit \
+  --algorithm.data_path=../trirl_dataset/rl_expert/trirl_expert_data_100_episodes.npz \
+  --algorithm.n_action_steps=8 --algorithm.total_gradient_steps=25000 --algorithm.evaluation_frequency=-1 \
+  --environment.name=pusht_mjx --environment.impl=jax --environment.nr_envs=512 \
+  --environment.random_TPos=True --environment.spawn_radius=0.2 --environment.feature_fn=base_without_ctrl \
+  --environment.curriculum_success=True \
+  --runner.mode=train --runner.save_model=True --runner.track_console=True
+```
+
+With `evaluation_frequency=-1` the run evaluates nothing and saves `latest.model` at the end. It is evaluated with
+`scripts/pusht/eval_policies.py OUT latest.model --n-eval 512 --seed 0`. Tuning (seed 0): `n_action_steps` 1 or 8 and
+25k / 50k / 100k steps all reach 27.5-33.2% success; the highest is 8 with 25k. Five seeds (1-5) with the command reach
+31.5 ± 1.9%. The demos start from 6 poses (100 demos each), while the evaluation draws start poses within 0.2 m. The
+demos step 0.025 s and the environment 0.05 s, but demos resampled to 0.05 s (pairs of steps merged, actions averaged)
+reach only 19.1% (seed 0), so the command uses the demos as they are.
 
 | Option | Default | Meaning |
 |---|---|---|
