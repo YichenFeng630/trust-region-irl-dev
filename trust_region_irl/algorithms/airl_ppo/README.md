@@ -15,6 +15,6 @@ Added on top of RL-X:
 - `best.model` is saved whenever `eval/episode_return` reaches a new high, next to `latest.model`.
 - The evaluation also logs the task metrics an environment reports: `eval/is_success`, `eval/success_clean`, `eval/coverage`, `eval/lifted`, `eval/wandered_off` (pizza), `eval/goal_dist`, `eval/goal_dist_2nd_half`, `eval/ball_lost` (ball balancing); PushT reports `eval/is_success`.
 
-For fixed-horizon tasks without terminations (pizza, ball balancing) set `--algorithm.handle_absorbing_states=False`: the demos mark their last step as absorbing only as an episode boundary.
+For fixed-horizon tasks without terminations (pizza, ball balancing with its default `lost_terminates=False`) set `--algorithm.handle_absorbing_states=False`: the demos mark their last step as absorbing only as an episode boundary. Ball balancing with `lost_terminates=True` (losing the ball ends the episode) keeps it on, as TRIRL-SPR does there.
 
 `flax_loco_mjx/` is the TRIRL paper's AIRL and is unchanged.

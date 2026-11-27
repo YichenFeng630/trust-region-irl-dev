@@ -6,6 +6,7 @@ action chunk every n_action_steps steps, so its cost is averaged over the chunk)
 compilation; the second is timed while nvidia-smi records GPU use. Writes OUT_DIR/bench_policy.json and gpu_*.csv.
 
     python scripts/gpu_cost/bench_policy.py OUT_DIR {pizza|balance|pusht} CKPT [CKPT ...] [--n-envs 512] [--steps 800]
+        [--obs-mode positions_history]   (balance: the obs_mode the policies were trained with)
 """
 import argparse
 import json
@@ -28,6 +29,7 @@ parser.add_argument("--steps", type=int, default=None, help="control steps (defa
 parser.add_argument("--impl", default="jax")
 parser.add_argument("--seed", type=int, default=12345)
 parser.add_argument("--min-seconds", type=float, default=5.0, help="repeat the timed run until it lasts this long, so nvidia-smi gets enough samples")
+parser.add_argument("--obs-mode", default="full", help="balance only: the env obs_mode the policies were trained with (full | positions_history)")
 args = parser.parse_args()
 OUT = Path(args.out_dir); OUT.mkdir(parents=True, exist_ok=True)
 
@@ -36,7 +38,7 @@ if args.env == "pizza":
     env = PizzaSpreadDR(render=False, nr_envs=args.n_envs, impl=args.impl)
 elif args.env == "balance":
     from trust_region_irl.environments.balance_fr3_mjx.environment import BalanceFR3
-    env = BalanceFR3(render=False, nr_envs=args.n_envs, impl=args.impl)
+    env = BalanceFR3(render=False, nr_envs=args.n_envs, impl=args.impl, obs_mode=args.obs_mode)
 else:
     from trust_region_irl.environments.pusht_mjx.environment import PushT
     env = PushT(render=False, random_TPos=True, spawn_radius=0.20, nr_envs=args.n_envs, impl=args.impl)

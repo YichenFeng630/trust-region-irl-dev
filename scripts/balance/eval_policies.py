@@ -6,7 +6,7 @@ the ball is lost. Every checkpoint sees the same episodes (same seed). Writes to
 (plate-local ball and goal paths of the first checkpoint, 4 episodes per family) and goal_dist.png (distance over time).
 
     python scripts/balance/eval_policies.py OUT_DIR CKPT [CKPT ...] [--expert trirl_dataset/rl_expert/balance_fr3_varied_300.npz]
-        [--n-eval 100] [--impl warp] [--dynamics ball_mass_scale=4 tilt_gain_scale=0.5 ...]
+        [--n-eval 100] [--impl warp] [--obs-mode full] [--dynamics ball_mass_scale=4 tilt_gain_scale=0.5 ...]
 
 Any saved model works (TRIRL, AIRL, PPO: deterministic mean action; Diffusion Policy: closed-loop action chunks with
 sampling noise drawn from --seed). Each checkpoint is rolled out twice on the same episodes: the first run includes the
@@ -38,6 +38,7 @@ parser.add_argument("--n-eval", type=int, default=100)
 parser.add_argument("--impl", default="warp", help="MJX backend: jax | warp")
 parser.add_argument("--seed", type=int, default=2026)
 parser.add_argument("--dynamics", nargs="*", default=[], help="env dynamics variant, e.g. ball_mass_scale=4 tilt_gain_scale=0.5")
+parser.add_argument("--obs-mode", default="full", help="the env obs_mode the policies were trained with: full | positions_history")
 args = parser.parse_args()
 OUT = Path(args.out_dir); OUT.mkdir(parents=True, exist_ok=True)
 DYN = {k: float(v) for k, v in (x.split("=") for x in args.dynamics)}
@@ -46,7 +47,8 @@ INK, INK2, SURF = "#0b0b0b", "#52514e", "#fcfcfb"
 C_GOAL, C_BALL = "#9a9994", "#2a78d6"
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
 
-env = BalanceFR3(render=False, nr_envs=args.n_eval, impl=args.impl, **DYN)
+env = BalanceFR3(render=False, nr_envs=args.n_eval, impl=args.impl, obs_mode=args.obs_mode, **DYN)
+IX = env.obs_index; BALL, GOAL = IX["ball_pos"].start, IX["goal_pos"].start
 H = env.horizon
 OBS_DIM = env.single_observation_space.shape[0]
 
@@ -74,8 +76,8 @@ def rollout(actor):
 
 
 def plate_local(obs, idx):
-    """Plate-local xy of the world point obs[..., idx:idx+3] (plate position 9:12, quaternion wxyz 12:16)."""
-    p, q, x = obs[..., 9:12], obs[..., 12:16], obs[..., idx:idx + 3]
+    """Plate-local xy of the world point obs[..., idx:idx+3] (plate position and quaternion wxyz from env.obs_index)."""
+    p, q, x = obs[..., IX["plate_pos"]], obs[..., IX["plate_quat"]], obs[..., idx:idx + 3]
     w, v = q[..., :1], -q[..., 1:4]   # inverse rotation
     d = x - p; t = 2 * np.cross(v, d)
     return (d + w * t + np.cross(v, t))[..., :2]
@@ -100,7 +102,7 @@ def label(ckpt):
 
 keys = jax.random.split(jax.random.PRNGKey(args.seed), args.n_eval)
 actor_key = jax.random.fold_in(jax.random.PRNGKey(args.seed), 1)   # Diffusion Policy's sampling noise, same for every checkpoint
-results, recs, computes = {"dynamics": DYN}, {}, {}
+results, recs, computes = {"dynamics": DYN, "obs_mode": args.obs_mode}, {}, {}
 fam, rec = rollout(ZeroActor())(None, keys, actor_key)
 fam = np.asarray(fam); recs["zero action"] = {k: np.asarray(v) for k, v in rec.items()}
 for ckpt in args.ckpts:
@@ -131,7 +133,7 @@ if args.expert:   # the expert's own distance: ball xy vs goal xy in the recorde
     d = np.load(args.expert)
     T_e = int(d["episode_lengths"][0])
     ns = d["next_states"].reshape(-1, T_e, d["next_states"].shape[-1]).transpose(1, 0, 2)
-    e_dist, e_fam = np.linalg.norm(ns[..., 0:2] - ns[..., 19:21], axis=-1), d["demo_meta"][:, 0].astype(int)
+    e_dist, e_fam = np.linalg.norm(ns[..., BALL:BALL + 2] - ns[..., GOAL:GOAL + 2], axis=-1), d["demo_meta"][:, 0].astype(int)   # the dataset must use the same obs_mode
     e = dict(goal_dist_cm=float(100 * e_dist.mean()), goal_dist_2nd_half_cm=float(100 * e_dist[T_e // 2:].mean()), n=int(e_dist.shape[1]))
     results["expert"] = {"all": e, **{n: dict(goal_dist_cm=float(100 * e_dist[:, e_fam == f].mean()),
                                               goal_dist_2nd_half_cm=float(100 * e_dist[T_e // 2:, e_fam == f].mean())) for f, n in enumerate(FAMS)}}
@@ -149,7 +151,7 @@ for f in range(5):
             ax.axis("off"); continue
         i = eps[j]
         ax.add_patch(plt.Rectangle((-19.5, -25), 39, 50, fill=False, lw=0.8, color=INK2))
-        g, b = plate_local(pr["obs"][:, i], 19) * 100, plate_local(pr["obs"][:, i], 0) * 100
+        g, b = plate_local(pr["obs"][:, i], GOAL) * 100, plate_local(pr["obs"][:, i], BALL) * 100
         ax.plot(g[:, 0], g[:, 1], color=C_GOAL, lw=2, ls="--"); ax.plot(b[:, 0], b[:, 1], color=C_BALL, lw=1.2)
         ax.plot(*b[0], "o", ms=5, color=C_BALL); ax.plot(*g[0], "o", ms=5, color=C_GOAL); ax.plot(*b[-1], "s", ms=5, color=C_BALL)
         ax.set_xlim(-21, 21); ax.set_ylim(-27, 27); ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])

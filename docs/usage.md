@@ -120,15 +120,24 @@ the plate. The model, solver options and task-space IK are BaMPC's.
   3-6 cm, frequency ratio 1:2 or 2:1, period 16-30 s); ramped waypoints (the goal glides at 2-4 cm/s to a random point,
   then picks a new one once the ball is within 3 cm). Moving paths faster than 6 cm/s are redrawn. The ball starts at a
   random point of the level plate.
-- **Observation (39):** ball position, linear and angular velocity (9); plate position, quaternion and angular velocity
-  (10); goal position and velocity (6); arm joint positions (7) and velocities (7). The reward input of
-  `byol-embodiment-free` is the first 25 entries.
-- No early termination; the logged metrics are `rollout/goal_dist`, `rollout/goal_dist_2nd_half`, `rollout/ball_lost`
-  and `rollout/goal_family`.
+- **Observation** (`obs_mode`, world frame; `env.obs_index` names the parts):
+  - `full` (39, default): ball position, linear and angular velocity (9); plate position, quaternion and angular
+    velocity (10); goal position and velocity (6); arm joint positions (7) and velocities (7).
+  - `positions_history` (43): ball position, plate position and quaternion, goal position and velocity (16); the
+    previous step's ball position, plate position and quaternion and goal position (13; at reset the current ones);
+    arm joints (14). No ball or plate velocities, as on the real robot.
+
+  The reward input of `byol-embodiment-free` (and AIRL's `embodiment-free`) is everything but the arm joints: the
+  first 25 entries (`full`) or 29 (`positions_history`).
+- By default no early termination; with `lost_terminates=True` losing the ball ends the episode as a failure
+  (terminated). The logged metrics are `rollout/goal_dist`, `rollout/goal_dist_2nd_half`, `rollout/ball_lost` and
+  `rollout/goal_family`.
 
 | Parameter | Default | Meaning |
 |---|---|---|
 | `horizon` | 200 | steps per episode (10 s, as the BaMPC demos) |
+| `obs_mode` | full | `full` (39) or `positions_history` (43, no velocities) |
+| `lost_terminates` | False | True: losing the ball ends the episode (terminated) |
 | `ball_mass_scale` | 1.0 | ball mass and inertia (a solid ball rolls the same at any mass; only large changes matter) |
 | `tilt_gain_scale` | 1.0 | plate tilt rate per unit action, inside the IK |
 | `ik_k_pos_scale` | 1.0 | IK gain holding the plate position |
@@ -247,7 +256,7 @@ added on top of RL-X are off by default, so the defaults behave as RL-X
 | `discriminator_uses_action` | False | g(s, a) instead of g(s), as `shaped-sa` in the TRIRL paper's code |
 | `max_std_dev` | -1 | > 0: the learnable policy std is projected back to at most this value after every update |
 | `log_pi_weight` | 1.0 | w in the PPO reward f - w log pi; the discriminator still uses f - log pi. The original AIRL code uses an entropy weight of 0.1 on Ant |
-| `handle_absorbing_states` | True | set False for pizza and ball balancing: they run a fixed horizon, and the demos mark their last step as absorbing only as an episode boundary |
+| `handle_absorbing_states` | True | set False for pizza and for ball balancing without `lost_terminates`: they run a fixed horizon, and the demos mark their last step as absorbing only as an episode boundary. Ball balancing with `lost_terminates=True` keeps it on |
 
 The PPO reward is logged in its two parts, `reward/f` (discriminator) and `reward/minus_log_pi` (entropy term).
 Evaluation logs the environment's task metrics (`eval/coverage`, `eval/is_success`, ... for pizza; `eval/goal_dist`,
