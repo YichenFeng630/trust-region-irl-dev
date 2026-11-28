@@ -257,7 +257,7 @@ added on top of RL-X are off by default, so the defaults behave as RL-X
 | `max_std_dev` | -1 | > 0: the learnable policy std is projected back to at most this value after every update |
 | `log_pi_weight` | 1.0 | w in the PPO reward f - w log pi; the discriminator still uses f - log pi. The original AIRL code uses an entropy weight of 0.1 on Ant |
 | `handle_absorbing_states` | True | set False for pizza and for ball balancing without `lost_terminates`: they run a fixed horizon, and the demos mark their last step as absorbing only as an episode boundary. Ball balancing with `lost_terminates=True` keeps it on |
-| `terminal_tail` | double | with absorbing states, the reward of the absorbing state after an episode ends in s'. `double` (RL-X): the discriminator's absorbing branch at (s', s'), so g(s') counts again on top of the gamma/(1-gamma) g(s') already in the ending step's f, about 10,000 g(s') in all at gamma 0.99, against 99 in the discriminator's loss; `single`: only the entropy term of the uniform absorbing policy, so g(s') counts once. A diagnostic: on PushT every tuned run with `double` stayed below 1% success, and with `single` the PushT settings below reach 96% (seed 0) |
+| `terminal_tail` | double | with absorbing states, the reward of the absorbing state after an episode ends in s'. `double` (RL-X): the discriminator's absorbing branch at (s', s'), so g(s') counts again on top of the gamma/(1-gamma) g(s') already in the ending step's f, about 10,000 g(s') in all at gamma 0.99, against 99 in the discriminator's loss; `single`: only the entropy term of the uniform absorbing policy, so g(s') counts once. A diagnostic: on PushT every tuned run with `double` stayed below 1% success, and with `single`, 128 steps and `log_pi_weight=0.03` reach 96% (seed 0) |
 
 The PPO reward is logged in its two parts, `reward/f` (discriminator) and `reward/minus_log_pi` (entropy term).
 Evaluation logs the environment's task metrics (`eval/coverage`, `eval/is_success`, ... for pizza; `eval/goal_dist`,
@@ -270,7 +270,7 @@ cd experiments
 python experiment.py --algorithm.name=airl_ppo.flax_full_jit \
   --algorithm.data_path=../trirl_dataset/rl_expert/pizza_dr_demos_100.npz \
   --algorithm.reward_input=embodiment-free --algorithm.handle_absorbing_states=False --algorithm.std_dev=0.4 \
-  --algorithm.nr_disc_steps=3 --algorithm.learning_rate_disc=1.7e-4 --algorithm.max_grad_norm=1.0 --algorithm.log_pi_weight=0.03 \
+  --algorithm.nr_disc_steps=3 --algorithm.learning_rate_disc=1.7e-4 --algorithm.max_grad_norm=1.0 \
   --algorithm.total_timesteps=500e6 --algorithm.evaluation_and_save_frequency=2048000 \
   --environment.name=pizza_dr_mjx --environment.impl=warp --environment.nr_envs=4096 \
   --runner.mode=train --runner.save_model=True --runner.track_console=True
@@ -278,24 +278,27 @@ python experiment.py --algorithm.name=airl_ppo.flax_full_jit \
 
 With the RL-X default (10 passes over the batch: 800 discriminator steps per iteration with 4096 environments and 10
 steps per rollout) the discriminator separates agent and expert samples almost perfectly on pizza within about 2M
-steps, so the command uses 3 steps per iteration. With the default `log_pi_weight=1` the policy std then still grows
-without bound: actions are clipped to [-1, 1], so a larger std raises -log pi at no cost. A weight of 0.1 or less keeps
-the std below about 1, but training is still not stable: coverage rises, then falls back and oscillates. Mean coverage
-after 50M of 100M steps (seed 0): 0.30 / 0.39 / 0.14 with `log_pi_weight` 0.01 / 0.03 / 0.1, and 0.19 with weight 1 and
-`max_std_dev=1`. A 500M run with 0.01 (seed 1) peaked at 0.53 after 18M steps and averaged 0.07 after 50M. The command
-uses 0.03, the best of these; these are the settings for the pizza comparison.
+steps, so the command uses 3 steps per iteration. These are the settings for the pizza comparison. The comparisons keep
+RL-X's -log pi weight of 1 (`log_pi_weight` is not set). With it the policy std grows without bound: actions are clipped
+to [-1, 1], so a larger std raises -log pi at no cost. With the command (seed 0, 100M steps) coverage peaks at 0.66
+after 8M steps and stays below 0.01 from 22M steps on, while the std reaches 1e13 by 45M steps.
+
+Earlier tuning with a smaller weight: 0.1 or less keeps the std below about 1, but training is still not stable
+(coverage rises, then falls back and oscillates). Mean coverage after 50M of 100M steps (seed 0): 0.30 / 0.39 / 0.14
+with `log_pi_weight` 0.01 / 0.03 / 0.1, and 0.19 with weight 1 and `max_std_dev=1`. A 500M run with 0.01 (seed 1)
+peaked at 0.53 after 18M steps and averaged 0.07 after 50M.
 
 The settings for the PushT comparison take everything shared with TRIRL-SPR from Mohammed's PushT run
 (`spr_k3_cT_oTask_DoRaT`): its demos, its environment (random start poses within 0.2 m, the success-threshold
-curriculum), its PPO settings and its discriminator learning rate and gradient penalty. Tuned on top of these:
-`nr_disc_steps`, `log_pi_weight` and `handle_absorbing_states`.
+curriculum), its PPO settings and its discriminator learning rate and gradient penalty. Tuned on top of these (with
+`log_pi_weight=0.03`): `nr_disc_steps` and `handle_absorbing_states`. The command keeps RL-X's -log pi weight of 1.
 
 ```bash
 cd experiments
 python experiment.py --algorithm.name=airl_ppo.flax_full_jit \
   --algorithm.data_path=../trirl_dataset/rl_expert/trirl_expert_data_100_episodes.npz \
   --algorithm.reward_input=task-based --algorithm.handle_absorbing_states=False \
-  --algorithm.nr_disc_steps=128 --algorithm.log_pi_weight=0.03 \
+  --algorithm.nr_disc_steps=128 \
   --algorithm.learning_rate=4e-4 --algorithm.anneal_learning_rate=True --algorithm.nr_steps=128 \
   --algorithm.max_grad_norm=5.0 --algorithm.std_dev=0.4 --algorithm.learning_rate_disc=1e-4 --algorithm.gp_lambda=0.5 \
   --algorithm.total_timesteps=200e6 --algorithm.evaluation_and_save_frequency=2097152 \
@@ -309,7 +312,8 @@ The metric for tuning was the mean `eval/is_success` over the evaluations after 
 (38 evaluations, seed 0 unless stated). An iteration is 524,288 environment steps; 128 discriminator steps per iteration match the
 TRIRL paper's 10 steps per 40,960 environment steps, and 38 match its 3.
 
-- With the command, seeds 0 / 1 / 2: 93.2 / 95.1 / 95.7% (mean 94.7 ± 1.3%). `latest.model` on the 512 start poses of
+- With the command (weight 1), seed 0: result pending (run started 2026-11-28).
+- With the command and `log_pi_weight=0.03`, seeds 0 / 1 / 2: 93.2 / 95.1 / 95.7% (mean 94.7 ± 1.3%). `latest.model` on the 512 start poses of
   `scripts/pusht/eval_policies.py`: 99.0 / 96.5 / 85.7% (93.8 ± 7.1%); for seed 2, 13% of the rollouts are `diverged`
   (the T leaves the table or the state turns NaN). Use `latest.model`: `best.model` (highest evaluation return) of seed 2 reaches only 54.9%.
   The same run with `learning_rate_disc=0` (reward never trained, seed 0) reaches 0%: the policy std grows to 7.
@@ -324,6 +328,33 @@ everywhere (about -1 near the goal, -1.7 far from it), so ending an episode soon
 only on success, so this sign works in the same direction as the task, and part of the success can come from it rather
 than from the shape of g (the termination bias of Kostrikov et al. 2019). TRIRL-SPR on PushT keeps the absorbing states.
 
+The settings for the ball-balancing comparison take everything shared with TRIRL-SPR from Santhosh's `set1hist`
+(`scripts/balance/set1hist/algo_config.json`): its demos, its environment (`positions_history`, `lost_terminates`) and
+its PPO and discriminator settings. Tuned on top of these (with `log_pi_weight=0.03`): `nr_disc_steps` and
+`terminal_tail`. The command keeps RL-X's -log pi weight of 1.
+
+```bash
+cd experiments
+python experiment.py --algorithm.name=airl_ppo.flax_full_jit \
+  --algorithm.data_path=../trirl_dataset/rl_expert/balance_fr3_varied_300_hist.npz \
+  --algorithm.reward_input=embodiment-free --algorithm.handle_absorbing_states=True \
+  --algorithm.nr_disc_steps=128 --algorithm.terminal_tail=single \
+  --algorithm.learning_rate=4e-4 --algorithm.anneal_learning_rate=True --algorithm.nr_steps=128 \
+  --algorithm.max_grad_norm=5.0 --algorithm.std_dev=0.4 --algorithm.learning_rate_disc=1e-4 --algorithm.gp_lambda=0.5 \
+  --algorithm.total_timesteps=500e6 --algorithm.evaluation_and_save_frequency=2097152 \
+  --environment.name=balance_fr3_mjx --environment.impl=warp --environment.nr_envs=4096 \
+  --environment.obs_mode=positions_history --environment.lost_terminates=True \
+  --runner.mode=train --runner.save_model=True --runner.track_console=True
+```
+
+The metric for tuning was the distance to the goal in the second half of the episode, averaged over the evaluations
+after 300M steps (seed 0). `latest.model` is evaluated with `scripts/balance/eval_policies.py` on 512 episodes (seed
+2026). With weight 0.03 and 128 steps no ball is lost; the distance is 1.74 cm (script 2.35 cm) with `terminal_tail=single`
+and 2.19 cm (script 1.70 cm) with `double`; with 38 steps it is 8-15 cm. TRIRL-SPR on the same 512 episodes: 1.33-1.53 cm
+on the episodes without a lost ball (seeds 0-2). `set1hist` as it is (10 passes over the batch, weight 1) was stopped
+by a std limit of 5 at 112M steps, at 9.6 cm. With the command (weight 1), `single` and `double` are both being run
+(2026-11-28, seed 0); the choice between them follows these runs.
+
 ### Diffusion Policy (`diffusion_policy.flax_full_jit`)
 
 A Flax port of the state-based Diffusion Policy with the CNN U-Net (Chi et al. 2023), from the official code
@@ -337,16 +368,20 @@ where it differs: [README](../trust_region_irl/algorithms/diffusion_policy/READM
 cd experiments
 python experiment.py --algorithm.name=diffusion_policy.flax_full_jit \
   --algorithm.data_path=../trirl_dataset/rl_expert/pizza_dr_demos_100.npz \
-  --algorithm.n_action_steps=1 --algorithm.total_gradient_steps=50000 --algorithm.evaluation_frequency=50000 \
+  --algorithm.n_action_steps=1 --algorithm.total_gradient_steps=1000000 --algorithm.evaluation_frequency=1000000 \
   --environment.name=pizza_dr_mjx --environment.impl=warp --environment.nr_envs=512 \
   --runner.mode=train --runner.save_model=True --runner.track_console=True
 ```
 
-These are the settings for the pizza comparison. With 100 demos, coverage falls with longer training although the
-training loss keeps decreasing: after 50k / 100k / 200k steps it is 0.69 / 0.62 / 0.60 with `n_action_steps=1` and
-0.65 / 0.57 / 0.55 with `n_action_steps=8` (seed 0, 512 episodes). The comparison reports coverage first, so the command
-trains 50k steps with `n_action_steps=1`; `n_action_steps=8` has the higher success rate (0.48 against 0.39 on the same
-512 pizzas). Five seeds with the command reach coverage 0.69 ± 0.02.
+These are the settings for the pizza comparison. All comparisons train 1M gradient steps, close to the paper's 4500
+epochs for its simulated state-based tasks (an epoch is the number of training windows divided by the batch size: 307
+steps here with `n_action_steps=1`, so 1M steps is about 3,260 epochs). The command evaluates once, at the end.
+
+`n_action_steps` was chosen in shorter runs. With 100 demos, coverage falls with longer training although the training
+loss keeps decreasing: after 50k / 100k / 200k steps it is 0.69 / 0.62 / 0.60 with `n_action_steps=1` and 0.65 / 0.57 /
+0.55 with `n_action_steps=8` (seed 0, 512 episodes). The comparison reports coverage first, so the command uses
+`n_action_steps=1`; `n_action_steps=8` has the higher success rate (0.48 against 0.39 on the same 512 pizzas). Five seeds
+at 50k steps reach coverage 0.69 ± 0.02; the 1M-step runs are pending.
 
 For the PushT comparison (Mohammed's demos and environment, as for AIRL above; the network and diffusion settings are
 the official ones):
@@ -355,7 +390,7 @@ the official ones):
 cd experiments
 python experiment.py --algorithm.name=diffusion_policy.flax_full_jit \
   --algorithm.data_path=../trirl_dataset/rl_expert/trirl_expert_data_100_episodes.npz \
-  --algorithm.n_action_steps=8 --algorithm.total_gradient_steps=25000 --algorithm.evaluation_frequency=-1 \
+  --algorithm.n_action_steps=8 --algorithm.total_gradient_steps=1000000 --algorithm.evaluation_frequency=-1 \
   --environment.name=pusht_mjx --environment.impl=jax --environment.nr_envs=512 \
   --environment.random_TPos=True --environment.spawn_radius=0.2 --environment.feature_fn=base_without_ctrl \
   --environment.curriculum_success=True \
@@ -363,11 +398,29 @@ python experiment.py --algorithm.name=diffusion_policy.flax_full_jit \
 ```
 
 With `evaluation_frequency=-1` the run evaluates nothing and saves `latest.model` at the end. It is evaluated with
-`scripts/pusht/eval_policies.py OUT latest.model --n-eval 512 --seed 0`. Tuning (seed 0): `n_action_steps` 1 or 8 and
-25k / 50k / 100k steps all reach 27.5-33.2% success; the highest is 8 with 25k. Five seeds (1-5) with the command reach
-31.5 ± 1.9%. The demos start from 6 poses (100 demos each), while the evaluation draws start poses within 0.2 m. The
-demos step 0.025 s and the environment 0.05 s, but demos resampled to 0.05 s (pairs of steps merged, actions averaged)
-reach only 19.1% (seed 0), so the command uses the demos as they are.
+`scripts/pusht/eval_policies.py OUT latest.model --n-eval 512 --seed 0`. 1M steps is about 3,750 epochs (267 steps
+per epoch). Tuning (seed 0): `n_action_steps` 1 or 8 and 25k / 50k / 100k steps all reach 27.5-33.2% success; the
+highest is 8 with 25k. Five seeds (1-5) at 25k steps reach 31.5 ± 1.9%; the 1M-step runs are pending. The demos start
+from 6 poses (100 demos each), while the evaluation draws start poses within 0.2 m. The demos step 0.025 s and the
+environment 0.05 s, but demos resampled to 0.05 s (pairs of steps merged, actions averaged) reach only 19.1% (seed 0),
+so the command uses the demos as they are.
+
+For the ball-balancing comparison (Santhosh's `set1hist` demos and environment, as for AIRL above):
+
+```bash
+cd experiments
+python experiment.py --algorithm.name=diffusion_policy.flax_full_jit \
+  --algorithm.data_path=../trirl_dataset/rl_expert/balance_fr3_varied_300_hist.npz \
+  --algorithm.n_action_steps=8 --algorithm.total_gradient_steps=1000000 --algorithm.evaluation_frequency=-1 \
+  --environment.name=balance_fr3_mjx --environment.impl=warp --environment.nr_envs=512 \
+  --environment.obs_mode=positions_history --environment.lost_terminates=True \
+  --runner.mode=train --runner.save_model=True --runner.track_console=True
+```
+
+`latest.model` is evaluated with `scripts/balance/eval_policies.py` (512 episodes, seed 2026). 1M steps is about 4,420
+epochs (226 steps per epoch). Tuning (seed 0), share of episodes that lose the ball: 77 / 54 / 49 / 50% after 25k / 50k /
+100k / 200k steps with `n_action_steps=8`, and 66 / 57 / 51% after 25k / 50k / 100k with `n_action_steps=1`; the command
+uses 8 (a tie with 1 at 100k goes to the official value). The 1M-step runs are pending.
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -381,9 +434,10 @@ On PushT with `curriculum_success` in the environment options, the evaluation us
 as for the online methods (Diffusion Policy trains offline, so the curriculum has no other effect).
 
 `latest.model` is written at every evaluation and `best.model` when the evaluation return reaches a new high. A
-checkpoint is about 525 MB (model and EMA copy, float32). Training runs at about 35 gradient steps per second on an
-RTX A5000 (JAX memory pool about 7.8 GB). Evaluating 512 pizza episodes takes about 2.5 min with `n_action_steps=8`
-and 11-20 min with `n_action_steps=1`, since every prediction runs the full denoising chain.
+checkpoint is about 525 MB (model and EMA copy, float32). Training runs at about 33-35 gradient steps per second on an
+RTX A5000 or 3090 (JAX memory pool about 7.8 GB), so a 1M-step run takes about 8 h; the port cannot resume a run.
+Evaluating 512 pizza episodes takes about 2.5 min with `n_action_steps=8` and 11-20 min with `n_action_steps=1`, since
+every prediction runs the full denoising chain.
 
 ## Runner options
 
